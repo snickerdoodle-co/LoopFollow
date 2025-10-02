@@ -346,8 +346,13 @@ class LoopAPNSService {
         // Create the proper APNS payload structure (matching @parse/node-apn format)
         var apnsPayload: [String: Any] = [
             "aps": [
-                "alert": payload["alert"] as? String ?? "",
+                "alert": [
+                    "title": "LoopFollow",
+                    "body": payload["alert"] as? String ?? "Remote bolus delivered"
+                    ],
                 "content-available": 1,
+                "sound": "",       // empty string = no sound
+                "badge": 0,        // don’t increment app badge
                 "interruption-level": "time-sensitive",
             ],
         ]
