@@ -29,6 +29,9 @@ struct GeneralSettingsView: View {
     @ObservedObject var speakHighBG = Storage.shared.speakHighBG
     @ObservedObject var speakHighBGLimit = Storage.shared.speakHighBGLimit
 
+    // Telemetry — see LoopFollow/Helpers/Telemetry.swift
+    @ObservedObject var telemetryEnabled = Storage.shared.telemetryEnabled
+
     var body: some View {
         NavigationView {
             Form {
@@ -131,6 +134,17 @@ struct GeneralSettingsView: View {
                             }
                         }
                     }
+                }
+
+                Section("Diagnostics") {
+                    Toggle("Send anonymous usage stats", isOn: $telemetryEnabled.value)
+                        .onChange(of: telemetryEnabled.value) { newValue in
+                            if newValue {
+                                TelemetryClient.shared.scheduleRecurring()
+                            }
+                        }
+                    NavigationLink("What's sent") { TelemetryPreviewView() }
+                    NavigationLink("Privacy") { TelemetryPrivacyView() }
                 }
             }
         }
