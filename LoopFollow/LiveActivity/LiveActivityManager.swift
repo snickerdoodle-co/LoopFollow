@@ -10,8 +10,10 @@ import os
 import UIKit
 import UserNotifications
 
-// Live Activity manager for LoopFollow. Every LA creation (start, renewal,
-// restart) and update goes through APNs push-to-start.
+// Live Activity manager for LoopFollow. LA creation prefers a local
+// Activity.request() while the app is foreground-active (no APNs round-trip,
+// no banner/Dynamic Island presentation); APNs push-to-start is the creation
+// path in the background. Updates go over APNs self-push.
 
 final class LiveActivityManager {
     static let shared = LiveActivityManager()
@@ -70,6 +72,7 @@ final class LiveActivityManager {
                     category: .general,
                     message: "[LA] push-to-start token received #\(deliveries) token=…\(tail) (prev=…\(previousTail))\(changed ? " CHANGED" : " same")"
                 )
+                HubClient.shared.reportLiveActivitySoon()
             }
             LogManager.shared.log(
                 category: .general,
@@ -108,8 +111,18 @@ final class LiveActivityManager {
 
     @MainActor
     private func adoptPushToStartActivity(_ activity: Activity<GlucoseLiveActivityAttributes>) {
+        if endedOrphanIDs.contains(activity.id) {
+            LogManager.shared.log(
+                category: .general,
+                message: "[LA] activityUpdates: ignoring ended orphan id=\(activity.id)"
+            )
+            return
+        }
         // Skip if it's the activity we already track (app-initiated path binds it directly).
-        if current?.id == activity.id {
+        // One that a refresh or start bound as an existing activity still gets adopted,
+        // since it may be a push-to-start activity that needs its own deadline.
+        let boundAsExisting = currentBindReason == "bind-existing" || currentBindReason == "reuse"
+        if current?.id == activity.id, !boundAsExisting {
             LogManager.shared.log(
                 category: .general,
                 message: "[LA] activityUpdates: ignoring own activity id=\(activity.id) (already current)"
@@ -144,16 +157,31 @@ final class LiveActivityManager {
             Task {
                 await oldActivity.end(nil, dismissalPolicy: .immediate)
             }
+        } else if current?.id == activity.id {
+            LogManager.shared.log(
+                category: .general,
+                message: "[LA] activityUpdates: adopting current activity id=\(activity.id) (bound via \(currentBindReason))"
+            )
         } else {
             LogManager.shared.log(
                 category: .general,
                 message: "[LA] activityUpdates: adopting new activity id=\(activity.id) (no prior current)"
             )
         }
-        // Fresh deadline — push-to-start-initiated LAs reset the 8-hour clock.
-        Storage.shared.laRenewBy.value = Date().timeIntervalSince1970 + LiveActivityManager.renewalThreshold
-        Storage.shared.laRenewalFailed.value = false
-        cancelRenewalFailedNotification()
+        // An activity bound before this launch keeps its deadline, since iOS counts its
+        // 8 hours from when it started; one started through push-to-start gets a fresh one.
+        let boundBeforeLaunch = (launchBoundActivityId ?? Storage.shared.laBoundActivityId.value) == activity.id
+            && Storage.shared.laRenewBy.value > 0
+        if boundBeforeLaunch {
+            LogManager.shared.log(
+                category: .general,
+                message: "[LA] adopt: id=\(activity.id) was bound before this launch — keeping renewBy=\(Storage.shared.laRenewBy.value)"
+            )
+        } else {
+            Storage.shared.laRenewBy.value = Date().timeIntervalSince1970 + LiveActivityManager.renewalThreshold
+            Storage.shared.laRenewalFailed.value = false
+            cancelRenewalFailedNotification()
+        }
         dismissedByUser = false
         // A fresh LA invalidates any latched foreground-restart intent — the
         // condition that prompted the latch (overlay showing / renewal failed)
@@ -174,18 +202,14 @@ final class LiveActivityManager {
     /// directly to the Live Activity while the app is still foreground-active,
     /// ensuring the LA is up to date the moment the lock screen appears.
     @objc private func handleWillResignActive() {
-        guard Storage.shared.laEnabled.value, let activity = current else { return }
+        guard Storage.shared.laEnabled.value, !HubClient.shared.drivesLiveActivity, let activity = current else { return }
 
-        refreshWorkItem?.cancel()
-        refreshWorkItem = nil
+        refreshCoalescer.cancel()
 
         let provider = StorageCurrentGlucoseStateProvider()
         guard let snapshot = GlucoseSnapshotBuilder.build(from: provider) else { return }
 
-        LAAppGroupSettings.setThresholds(
-            lowMgdl: Storage.shared.lowLine.value,
-            highMgdl: Storage.shared.highLine.value,
-        )
+        writeThresholds()
         GlucoseSnapshotStore.shared.save(snapshot)
 
         seq += 1
@@ -409,6 +433,11 @@ final class LiveActivityManager {
 
     static let renewalThreshold: TimeInterval = 7.5 * 3600
     static let renewalWarning: TimeInterval = 30 * 60
+    /// Remaining time on `laRenewBy` below which a foreground entry proactively
+    /// replaces the healthy LA with a locally created one, resetting the 8-hour
+    /// clock without an APNs push-to-start. Local-only by design: if the local
+    /// request fails, the existing LA still has hours left, so no fallback fires.
+    static let opportunisticRenewalThreshold: TimeInterval = 4 * 3600
     static let extensionLivenessGrace: TimeInterval = 15 * 60
 
     /// Base backoff after a 429 for push-to-start; doubled on each subsequent 429,
@@ -431,13 +460,28 @@ final class LiveActivityManager {
     private static let pushToStartTokenRetryDelay: TimeInterval = 10
 
     private(set) var current: Activity<GlucoseLiveActivityAttributes>?
+    /// The `logReason` of the bind that made `current` the tracked activity.
+    private var currentBindReason = ""
+    /// The activity bound when the previous launch ended, read before this launch's first bind.
+    private var launchBoundActivityId: String?
+    /// Activities ended as orphans; `activityUpdates` may still deliver them.
+    private var endedOrphanIDs: Set<String> = []
+
+    /// Push token of the activity currently tracked, as reported to LF Hub.
+    var currentPushToken: String? {
+        current == nil ? nil : pushToken
+    }
+
     private var stateObserverTask: Task<Void, Never>?
     private var updateTask: Task<Void, Never>?
     private var seq: Int = 0
     private var lastUpdateTime: Date?
     private var pushToken: String?
     private var tokenObservationTask: Task<Void, Never>?
-    private var refreshWorkItem: DispatchWorkItem?
+    private lazy var refreshCoalescer = RefreshCoalescer(delay: 20) { [weak self] reason in
+        self?.performRefresh(reason: reason)
+    }
+
     /// Set when the user manually swipes away the LA. Blocks auto-restart until
     /// an explicit user action (Restart button, App Intent) clears it.
     /// In-memory only — resets to false on app relaunch, so a kill + relaunch
@@ -496,28 +540,47 @@ final class LiveActivityManager {
         let startReason = nextStartReasonOverride ?? "user-start"
         nextStartReasonOverride = nil
 
-        // Push-to-start is used for every creation path. If an activity is
-        // already running and not stale we adopt/reuse it (covers warm starts
-        // where the LA survived a relaunch); only truly new starts dispatch APNs.
-        if let existing = Activity<GlucoseLiveActivityAttributes>.activities.first {
+        // If an activity is already running and not stale we adopt/reuse it
+        // (covers warm starts where the LA survived a relaunch); only truly new
+        // starts go through createActivity (local when foreground, APNs otherwise).
+        // The tracked activity comes first, then any active one; the others are orphans.
+        let activities = Activity<GlucoseLiveActivityAttributes>.activities
+        let tracked = activities.first { $0.id == current?.id && $0.activityState == .active }
+        if let existing = tracked ?? activities.first(where: { $0.activityState == .active }) ?? activities.first {
             let renewBy = Storage.shared.laRenewBy.value
             let now = Date().timeIntervalSince1970
             let staleDatePassed = existing.content.staleDate.map { $0 <= Date() } ?? false
             let inRenewalWindow = renewBy > 0 && now >= renewBy - LiveActivityManager.renewalWarning
             let needsRestart = Storage.shared.laRenewalFailed.value || inRenewalWindow || staleDatePassed
             if !needsRestart {
+                // Opportunistic renewal: the LA is healthy but in the back half
+                // of its 8-hour lifetime and the app is open — replace it locally
+                // now so the background push-to-start renewal (and its banner) is
+                // not needed later. On failure the existing LA is kept.
+                let remaining = renewBy - now
+                if renewBy > 0, remaining < LiveActivityManager.opportunisticRenewalThreshold,
+                   isAppVisibleForLiveActivityStart(), !isAwaitingPushToStartAdoption
+                {
+                    if attemptLocalCreate(reason: "opportunistic-renew", oldActivity: existing) {
+                        return
+                    }
+                }
                 bind(to: existing, logReason: "reuse")
                 Storage.shared.laRenewalFailed.value = false
+                endOrphanedActivities()
                 return
             }
             LogManager.shared.log(
                 category: .general,
-                message: "[LA] existing activity is stale on startIfNeeded — push-to-start replace (staleDatePassed=\(staleDatePassed), inRenewalWindow=\(inRenewalWindow))"
+                message: "[LA] existing activity is stale on startIfNeeded — replacing (staleDatePassed=\(staleDatePassed), inRenewalWindow=\(inRenewalWindow))"
             )
-            attemptPushToStartCreate(reason: startReason, oldActivity: existing)
+            createActivity(reason: startReason, oldActivity: existing)
+            if currentBindReason.hasPrefix("local-create") {
+                endOrphanedActivities()
+            }
             return
         }
-        attemptPushToStartCreate(reason: startReason, oldActivity: nil)
+        createActivity(reason: startReason, oldActivity: nil)
     }
 
     /// Called from applicationWillTerminate. Ends the LA synchronously (blocking
@@ -624,10 +687,7 @@ final class LiveActivityManager {
 
         let provider = StorageCurrentGlucoseStateProvider()
         if let snapshot = GlucoseSnapshotBuilder.build(from: provider) {
-            LAAppGroupSettings.setThresholds(
-                lowMgdl: Storage.shared.lowLine.value,
-                highMgdl: Storage.shared.highLine.value,
-            )
+            writeThresholds()
             LAAppGroupSettings.setDisplayName(
                 Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "LoopFollow",
                 show: Storage.shared.showDisplayName.value
@@ -640,12 +700,12 @@ final class LiveActivityManager {
     func refreshFromCurrentState(reason: String) {
         // No LA guard here — Watch and store must update regardless of LA state.
         // LA-specific gating (laEnabled, dismissedByUser) is applied inside performRefresh.
-        refreshWorkItem?.cancel()
-        let workItem = DispatchWorkItem { [weak self] in
-            self?.performRefresh(reason: reason)
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { self.refreshFromCurrentState(reason: reason) }
+            return
         }
-        refreshWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 20.0, execute: workItem)
+        WatchSessionManager.shared.requestUpdate(reason: reason)
+        refreshCoalescer.request(reason: reason)
     }
 
     // MARK: - Renewal
@@ -654,7 +714,8 @@ final class LiveActivityManager {
     /// deadline has passed, working around Apple's 8-hour maximum LA lifetime.
     /// Returns true if renewal was performed (caller should return early).
     private func renewIfNeeded(snapshot: GlucoseSnapshot) -> Bool {
-        guard let oldActivity = current else { return false }
+        // LF Hub renews through push-to-start when it drives the activity.
+        guard !HubClient.shared.drivesLiveActivity, let oldActivity = current else { return false }
 
         let renewBy = Storage.shared.laRenewBy.value
         guard renewBy > 0, Date().timeIntervalSince1970 >= renewBy else { return false }
@@ -662,18 +723,148 @@ final class LiveActivityManager {
         let overdueBy = Date().timeIntervalSince1970 - renewBy
         LogManager.shared.log(category: .general, message: "[LA] renewal deadline passed by \(Int(overdueBy))s, requesting new LA")
 
-        // Renewal goes through push-to-start. The dispatch hops to MainActor
-        // and returns immediately; adoption (or failure) lands in the observer.
+        // Renewal goes through createActivity: local if the app happens to be
+        // foreground-active at the deadline, push-to-start otherwise. The
+        // dispatch hops to MainActor and returns immediately; push-to-start
+        // adoption (or failure) lands in the observer.
         // Return true so performRefresh stops processing this tick.
         Task { @MainActor [weak self] in
-            self?.attemptPushToStartCreate(reason: "renew", oldActivity: oldActivity, snapshot: snapshot)
+            self?.createActivity(reason: "renew", oldActivity: oldActivity, snapshot: snapshot)
         }
         return true
     }
 
+    // MARK: - Creation dispatch
+
+    /// Single entry point for every LA creation (initial start, renewal,
+    /// forced restart, expired-token recovery). Prefers a local
+    /// Activity.request() while the app is foreground-active and falls back to
+    /// APNs push-to-start, the only creation transport while backgrounded.
+    @MainActor
+    private func createActivity(
+        reason: String,
+        oldActivity: Activity<GlucoseLiveActivityAttributes>?,
+        snapshot: GlucoseSnapshot? = nil
+    ) {
+        if isAwaitingPushToStartAdoption {
+            LogManager.shared.log(
+                category: .general,
+                message: "[LA] create (\(reason)): a push-to-start is awaiting adoption — not creating"
+            )
+            return
+        }
+        if isAppVisibleForLiveActivityStart() {
+            if attemptLocalCreate(reason: reason, oldActivity: oldActivity, snapshot: snapshot) {
+                return
+            }
+        }
+        attemptPushToStartCreate(reason: reason, oldActivity: oldActivity, snapshot: snapshot)
+    }
+
+    /// A push-to-start accepted by APNs this recently is still expected to
+    /// arrive through activityUpdates; creating meanwhile would replace the LA twice.
+    static let pushToStartAdoptionWindow: TimeInterval = 30
+
+    private var isAwaitingPushToStartAdoption: Bool {
+        guard let sentAt = lastPushToStartSuccessAt else { return false }
+        return Date().timeIntervalSince(sentAt) < LiveActivityManager.pushToStartAdoptionWindow
+    }
+
+    /// Foreground-only local creation via Activity.request(pushType: .token).
+    /// Returns false when creation is not possible; the caller decides whether
+    /// to fall back to push-to-start. APNs credentials stay a hard prerequisite
+    /// even here — background renewal and updates depend on them.
+    @MainActor
+    private func attemptLocalCreate(
+        reason: String,
+        oldActivity: Activity<GlucoseLiveActivityAttributes>?,
+        snapshot: GlucoseSnapshot? = nil
+    ) -> Bool {
+        let keyId = Storage.shared.lfKeyId.value
+        let apnsKey = Storage.shared.lfApnsKey.value
+        guard APNsCredentialValidator.isFullyConfigured(keyId: keyId, apnsKey: apnsKey) else {
+            LogManager.shared.log(
+                category: .general,
+                message: "[LA] local create (\(reason)) blocked — APNs credentials missing"
+            )
+            return false
+        }
+
+        let workingSnapshot = snapshot ?? buildWorkingSnapshot()
+        seq += 1
+        let nextSeq = seq
+        let state = GlucoseLiveActivityAttributes.ContentState(
+            snapshot: workingSnapshot.withRenewalOverlay(false),
+            seq: nextSeq,
+            reason: reason,
+            producedAt: Date(),
+        )
+        let staleDate = Date().addingTimeInterval(LiveActivityManager.renewalThreshold)
+        let content = ActivityContent(
+            state: state,
+            staleDate: staleDate,
+            relevanceScore: 100.0,
+        )
+
+        do {
+            let activity = try Activity.request(
+                attributes: GlucoseLiveActivityAttributes(title: "LoopFollow"),
+                content: content,
+                pushType: .token,
+            )
+            LogManager.shared.log(
+                category: .general,
+                message: "[LA] local create (\(reason)) succeeded id=\(activity.id) seq=\(nextSeq)"
+            )
+            Storage.shared.laRenewBy.value = staleDate.timeIntervalSince1970
+            Storage.shared.laRenewalFailed.value = false
+            cancelRenewalFailedNotification()
+            pendingForegroundRestart = false
+            // The new activity's token arrives through its own observation;
+            // the old token must not be used for updates meanwhile.
+            pushToken = nil
+            lastPushToStartSuccessAt = nil
+            pushToStartSendsWithoutAdoption = 0
+            Storage.shared.laPushToStartBackoff.value = 0
+            // Bind before ending the old activity so its .dismissed is never
+            // misclassified as a user swipe.
+            bind(to: activity, logReason: "local-create-\(reason)")
+            if let oldActivity, oldActivity.id != activity.id {
+                Task {
+                    await oldActivity.end(nil, dismissalPolicy: .immediate)
+                }
+            }
+            return true
+        } catch {
+            LogManager.shared.log(
+                category: .general,
+                message: "[LA] local create (\(reason)) failed: \(error.localizedDescription)"
+            )
+            return false
+        }
+    }
+
+    /// Snapshot fallback chain for creation paths that were not handed one.
+    private func buildWorkingSnapshot() -> GlucoseSnapshot {
+        let provider = StorageCurrentGlucoseStateProvider()
+        return GlucoseSnapshotBuilder.build(from: provider)
+            ?? GlucoseSnapshotStore.shared.load()
+            ?? GlucoseSnapshot(
+                glucose: 0,
+                delta: 0,
+                trend: .unknown,
+                updatedAt: Date(),
+                iob: nil,
+                cob: nil,
+                projected: nil,
+                unit: .mgdl,
+                isNotLooping: false,
+            )
+    }
+
     // MARK: - Push-to-start
 
-    /// Single creation path. Handles initial start, renewal, and forced restart.
+    /// Background creation path (also the fallback when a local create fails).
     /// Verifies token + APNs credentials, applies backoff, then dispatches the
     /// APNs push-to-start call. The old activity is only ended after a confirmed
     /// successful send, preserving it if the send fails. Adoption is delivered
@@ -711,23 +902,7 @@ final class LiveActivityManager {
         }
 
         // Build snapshot if caller didn't supply one (initial start path).
-        let workingSnapshot: GlucoseSnapshot = {
-            if let snapshot { return snapshot }
-            let provider = StorageCurrentGlucoseStateProvider()
-            return GlucoseSnapshotBuilder.build(from: provider)
-                ?? GlucoseSnapshotStore.shared.load()
-                ?? GlucoseSnapshot(
-                    glucose: 0,
-                    delta: 0,
-                    trend: .unknown,
-                    updatedAt: Date(),
-                    iob: nil,
-                    cob: nil,
-                    projected: nil,
-                    unit: .mgdl,
-                    isNotLooping: false,
-                )
-        }()
+        let workingSnapshot = snapshot ?? buildWorkingSnapshot()
 
         Task { [weak self] in
             guard let self else { return }
@@ -904,6 +1079,12 @@ final class LiveActivityManager {
         }
     }
 
+    /// Publishes the range for the selected time-in-range mode, matching the chart and BG header.
+    private func writeThresholds() {
+        let thresholds = UnitSettingsStore.shared.effectiveThresholds()
+        LAAppGroupSettings.setThresholds(lowMgdl: thresholds.low, highMgdl: thresholds.high)
+    }
+
     private func performRefresh(reason: String) {
         let provider = StorageCurrentGlucoseStateProvider()
         guard let snapshot = GlucoseSnapshotBuilder.build(from: provider) else {
@@ -928,14 +1109,11 @@ final class LiveActivityManager {
         let forceRefreshNeeded = timeSinceLastUpdate >= 5 * 60
         // Capture dedup result BEFORE saving so the store comparison is valid.
         let snapshotUnchanged = GlucoseSnapshotStore.shared.load() == snapshot
+        let thresholdsChanged = LAAppGroupSettings.thresholdsMgdl() != UnitSettingsStore.shared.effectiveThresholds()
 
-        // Store + Watch: always update, independent of LA state.
-        LAAppGroupSettings.setThresholds(
-            lowMgdl: Storage.shared.lowLine.value,
-            highMgdl: Storage.shared.highLine.value,
-        )
+        // Store: always update, independent of LA state.
+        writeThresholds()
         GlucoseSnapshotStore.shared.save(snapshot)
-        // WatchConnectivityManager.shared.send(snapshot: snapshot)
 
         // LA update: gated on LA being active, snapshot having changed, and activities enabled.
         if !Storage.shared.laEnabled.value {
@@ -946,7 +1124,7 @@ final class LiveActivityManager {
             LogManager.shared.log(category: .general, message: "[LA] refresh: LA update skipped — dismissedByUser=true reason=\(reason)")
             return
         }
-        guard !snapshotUnchanged || forceRefreshNeeded else { return }
+        guard !snapshotUnchanged || thresholdsChanged || forceRefreshNeeded else { return }
         guard ActivityAuthorizationInfo().areActivitiesEnabled else {
             LogManager.shared.log(category: .general, message: "[LA] refresh: LA update skipped — areActivitiesEnabled=false reason=\(reason)")
             return
@@ -989,6 +1167,8 @@ final class LiveActivityManager {
         }
 
         guard let activity = current else { return }
+        // LF Hub sends every update while it drives the activity.
+        if HubClient.shared.drivesLiveActivity { return }
 
         updateTask?.cancel()
 
@@ -1068,6 +1248,7 @@ final class LiveActivityManager {
         for activity in Activity<GlucoseLiveActivityAttributes>.activities {
             guard activity.id != current?.id else { continue }
             let orphanID = activity.id
+            endedOrphanIDs.insert(orphanID)
             Task {
                 await activity.end(nil, dismissalPolicy: .immediate)
                 LogManager.shared.log(category: .general, message: "Ended orphaned Live Activity id=\(orphanID)")
@@ -1077,7 +1258,12 @@ final class LiveActivityManager {
 
     private func bind(to activity: Activity<GlucoseLiveActivityAttributes>, logReason: String) {
         if current?.id == activity.id { return }
+        if launchBoundActivityId == nil {
+            launchBoundActivityId = Storage.shared.laBoundActivityId.value
+        }
         current = activity
+        currentBindReason = logReason
+        Storage.shared.laBoundActivityId.value = activity.id
         let wasEndingForRestart = endingForRestart
         dismissedByUser = false
         endingForRestart = false
@@ -1103,6 +1289,7 @@ final class LiveActivityManager {
                     category: .general,
                     message: "[LA] push token received id=\(activityID) token=…\(tail) (prev=…\(previousTail))"
                 )
+                HubClient.shared.reportLiveActivitySoon()
             }
         }
     }
@@ -1125,7 +1312,7 @@ final class LiveActivityManager {
         // endingForRestart and turning the eventual iOS dismissal into a misclassified
         // user swipe. Drive the restart synchronously instead.
         Task { @MainActor [weak self] in
-            self?.attemptPushToStartCreate(reason: "expired-token", oldActivity: nil)
+            self?.createActivity(reason: "expired-token", oldActivity: nil)
         }
     }
 
@@ -1200,6 +1387,7 @@ final class LiveActivityManager {
                     let wasCurrentActivity = current?.id == activity.id
                     if wasCurrentActivity {
                         current = nil
+                        HubClient.shared.reportLiveActivitySoon()
                         // Do NOT clear laRenewBy here. Preserving it means handleForeground()
                         // can detect the renewal window on the next foreground event and restart
                         // automatically — whether the LA ended normally (.ended) or was

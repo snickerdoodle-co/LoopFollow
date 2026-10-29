@@ -34,6 +34,7 @@ class AlarmManager {
             BatteryCondition.self,
             BatteryDropCondition.self,
             FutureCarbsCondition.self,
+            MissedBolusCondition.self,
             DBSizeCondition.self,
         ]
     ) {
@@ -55,6 +56,20 @@ class AlarmManager {
             return
         }
 
+        // LF Hub evaluates and delivers the alarms of the types it checks while it drives
+        // them; this app checks the rest. A sound this app started for an alarm the hub
+        // checks stops; the hub's alarm rings instead.
+        var alarms = Storage.shared.alarms.value
+        let hubDrives = HubClient.shared.drivesAlarms
+        if hubDrives {
+            alarms = HubClient.shared.alarmsCheckedHere(alarms)
+            let soundsHere = Observable.shared.currentAlarm.value.map { id in alarms.contains { $0.id == id } } ?? false
+            if Observable.shared.alarmSoundPlaying.value, !soundsHere {
+                AlarmSound.stop()
+            }
+            if alarms.isEmpty { return }
+        }
+
         let config = Storage.shared.alarmConfiguration.value
 
         // Honor the "Snooze All" setting. If active, stop any current alarm and exit.
@@ -64,8 +79,6 @@ class AlarmManager {
             }
             return
         }
-
-        let alarms = Storage.shared.alarms.value
 
         let sorted = alarms.sorted(by: Alarm.byPriorityThenSpec)
         var skipType: AlarmType?
@@ -126,16 +139,24 @@ class AlarmManager {
                 continue
             }
 
-            // If this alarm is active, and still fulfill the requirements, let it be active
-            // Break the loop, nothing else to do
+            let titleOverride = checker.firedTitle
+
+            // An active alarm that still fulfills the requirements stays active.
+            // A different phase of it (an end alarm's early warning followed
+            // by the end itself) is announced with its own title.
             if Observable.shared.currentAlarm.value == alarm.id {
+                if titleOverride != Observable.shared.currentAlarmTitleOverride.value {
+                    Observable.shared.currentAlarmTitleOverride.value = titleOverride
+                    alarm.trigger(config: Storage.shared.alarmConfiguration.value, now: now, titleOverride: titleOverride)
+                }
                 break
             }
 
             // Fire the alarm and break the loop; we only allow one alarm per evaluation tick.
+            Observable.shared.currentAlarmTitleOverride.value = titleOverride
             Observable.shared.currentAlarm.value = alarm.id
 
-            alarm.trigger(config: Storage.shared.alarmConfiguration.value, now: now)
+            alarm.trigger(config: Storage.shared.alarmConfiguration.value, now: now, titleOverride: titleOverride)
 
             // Store the latest bg time so we don't use it again
             if alarm.type.isBGBased,
@@ -158,7 +179,7 @@ class AlarmManager {
             break
         }
 
-        if isLatestReadingRecent, Storage.shared.persistentNotification.value, !alarmTriggered, let latestDate = data.bgReadings.last?.date, latestDate > Storage.shared.persistentNotificationLastBGTime.value {
+        if !hubDrives, isLatestReadingRecent, Storage.shared.persistentNotification.value, !alarmTriggered, let latestDate = data.bgReadings.last?.date, latestDate > Storage.shared.persistentNotificationLastBGTime.value {
             sendNotification(title: "Latest BG")
             Storage.shared.persistentNotificationLastBGTime.value = now
         }
@@ -181,12 +202,20 @@ class AlarmManager {
     }
 
     func stopAlarm() {
+        // A hub-delivered alarm also rings as a system alarm and repeats at the hub.
+        if let alarmID = Observable.shared.currentAlarm.value, HubClient.shared.isHubMode {
+            #if !targetEnvironment(macCatalyst)
+                if #available(iOS 26, *) { HubAlarmKit.stop(alarmID: alarmID) }
+            #endif
+            HubClient.shared.alarmHandled(alarmID)
+        }
         AlarmSound.stop()
         Observable.shared.currentAlarm.value = nil
+        Observable.shared.currentAlarmTitleOverride.value = nil
         UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
     }
 
-    func sendNotification(title: String, actionTitle: String? = nil) {
+    func sendNotification(title: String, body: String? = nil, actionTitle: String? = nil) {
         UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
 
         let content = UNMutableNotificationContent()
@@ -194,6 +223,9 @@ class AlarmManager {
         content.subtitle += Observable.shared.bgText.value + " "
         content.subtitle += Observable.shared.directionText.value + " "
         content.subtitle += Observable.shared.deltaText.value
+        if let body {
+            content.body = body
+        }
         content.categoryIdentifier = "category"
         content.sound = .default
 
@@ -202,9 +234,22 @@ class AlarmManager {
         UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
 
         if let actionTitle = actionTitle {
-            let action = UNNotificationAction(identifier: "snooze", title: actionTitle, options: [])
-            let category = UNNotificationCategory(identifier: "category", actions: [action], intentIdentifiers: [], options: [])
-            UNUserNotificationCenter.current().setNotificationCategories([category])
+            Self.registerNotificationCategories(snoozeTitle: actionTitle)
         }
+    }
+
+    /// Registers every notification category the app's notifications use; each call
+    /// replaces the whole set. "category" carries the snooze action of the app's and
+    /// LF Hub's alarms, titled for the latest alarm; "lfhub-ack" carries the Acknowledge
+    /// action of LF Hub's alarms whose snooze duration is 0.
+    static func registerNotificationCategories(snoozeTitle: String = "Snooze") {
+        let openApp = UNNotificationAction(identifier: "OPEN_APP_ACTION", title: "Open App", options: .foreground)
+        let snooze = UNNotificationAction(identifier: "snooze", title: snoozeTitle, options: [])
+        let acknowledge = UNNotificationAction(identifier: "snooze", title: "Acknowledge", options: [])
+        UNUserNotificationCenter.current().setNotificationCategories([
+            UNNotificationCategory(identifier: BackgroundAlertIdentifier.categoryIdentifier, actions: [openApp], intentIdentifiers: [], options: []),
+            UNNotificationCategory(identifier: "category", actions: [snooze], intentIdentifiers: [], options: []),
+            UNNotificationCategory(identifier: HubAppGroup.acknowledgeCategory, actions: [acknowledge], intentIdentifiers: [], options: []),
+        ])
     }
 }

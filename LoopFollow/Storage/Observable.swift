@@ -36,6 +36,9 @@ class Observable {
     var predictionColor = ObservableValue<Color>(default: .purple)
 
     var currentAlarm = ObservableValue<UUID?>(default: nil)
+    /// Replaces the current alarm's name on screen when the firing needs its
+    /// own wording (e.g. an end alarm's early warning); nil shows the name.
+    var currentAlarmTitleOverride = ObservableValue<String?>(default: nil)
     var alarmSoundPlaying = ObservableValue<Bool>(default: false)
 
     var debug = ObservableValue<Bool>(default: false)
@@ -56,6 +59,9 @@ class Observable {
     var loopFollowDeviceToken = ObservableValue<String>(default: "")
 
     var isNotLooping = ObservableValue<Bool>(default: false)
+
+    /// CGM state reported after the newest reading; nil while readings flow.
+    var cgmSensorState = ObservableValue<CGMSensorState?>(default: nil)
 
     /// Selected tab index used by SwiftUI TabView — set from MainViewController to switch tabs
     var selectedTabIndex = ObservableValue<Int>(default: 0)

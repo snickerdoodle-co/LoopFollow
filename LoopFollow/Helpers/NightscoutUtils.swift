@@ -65,21 +65,12 @@ class NightscoutUtils {
         }
     }
 
-    static func executeRequest<T: Decodable>(eventType: EventType, parameters: [String: String], completion: @escaping (Result<T, Error>) -> Void) {
-        let baseURL = Storage.shared.url.value
-        let token = Storage.shared.token.value
-
-        guard let url = NightscoutUtils.constructURL(baseURL: baseURL, token: token, endpoint: eventType.endpoint, parameters: parameters) else {
-            completion(.failure(NSError(domain: "NightscoutUtils", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to construct URL"])))
-            return
-        }
-
-        var request = URLRequest(url: url)
-        request.cachePolicy = URLRequest.CachePolicy.reloadIgnoringLocalCacheData
-
-        let task = URLSession.shared.dataTask(with: request) { data, _, error in
+    /// `hubPart` names the LF Hub bundle part that answers this request in Hub mode;
+    /// without one, or without the part, the request goes to Nightscout.
+    static func executeRequest<T: Decodable>(eventType: EventType, parameters: [String: String], hubPart: HubBundle.Part? = nil, completion: @escaping (Result<T, Error>) -> Void) {
+        load(eventType: eventType, parameters: parameters, hubPart: hubPart) { data, error in
             guard let data = data, error == nil else {
-                completion(.failure(error!))
+                completion(.failure(error ?? NSError(domain: "NightscoutUtils", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to construct URL"])))
                 return
             }
 
@@ -109,24 +100,12 @@ class NightscoutUtils {
                 completion(.failure(error))
             }
         }
-        task.resume()
     }
 
-    static func executeDynamicRequest(eventType: EventType, parameters: [String: String], completion: @escaping (Result<Any, Error>) -> Void) {
-        let baseURL = Storage.shared.url.value
-        let token = Storage.shared.token.value
-
-        guard let url = NightscoutUtils.constructURL(baseURL: baseURL, token: token, endpoint: eventType.endpoint, parameters: parameters) else {
-            completion(.failure(NSError(domain: "NightscoutUtils", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to construct URL"])))
-            return
-        }
-
-        var request = URLRequest(url: url)
-        request.cachePolicy = URLRequest.CachePolicy.reloadIgnoringLocalCacheData
-
-        let task = URLSession.shared.dataTask(with: request) { data, _, error in
+    static func executeDynamicRequest(eventType: EventType, parameters: [String: String], hubPart: HubBundle.Part? = nil, completion: @escaping (Result<Any, Error>) -> Void) {
+        load(eventType: eventType, parameters: parameters, hubPart: hubPart) { data, error in
             guard let data = data, error == nil else {
-                completion(.failure(error!))
+                completion(.failure(error ?? NSError(domain: "NightscoutUtils", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to construct URL"])))
                 return
             }
 
@@ -146,7 +125,38 @@ class NightscoutUtils {
                 completion(.failure(error))
             }
         }
-        task.resume()
+    }
+
+    /// The response bytes: the LF Hub bundle part in Hub mode when there is a current
+    /// one, otherwise a Nightscout request when Nightscout is set up.
+    private static func load(eventType: EventType, parameters: [String: String], hubPart: HubBundle.Part?,
+                             completion: @escaping (Data?, Error?) -> Void)
+    {
+        let fromNightscout = {
+            let baseURL = Storage.shared.url.value
+            let token = Storage.shared.token.value
+            guard let url = NightscoutUtils.constructURL(baseURL: baseURL, token: token, endpoint: eventType.endpoint, parameters: parameters) else {
+                completion(nil, nil)
+                return
+            }
+            var request = URLRequest(url: url)
+            request.cachePolicy = URLRequest.CachePolicy.reloadIgnoringLocalCacheData
+            URLSession.shared.dataTask(with: request) { data, _, error in completion(data, error) }.resume()
+        }
+
+        guard let hubPart, HubBundle.shared.isActive else {
+            fromNightscout()
+            return
+        }
+        Task {
+            if let data = await HubBundle.shared.data(for: hubPart) {
+                completion(data, nil)
+            } else if IsNightscoutEnabled() {
+                fromNightscout()
+            } else {
+                completion(nil, NSError(domain: "NightscoutUtils", code: -1, userInfo: [NSLocalizedDescriptionKey: "No current LF Hub data and no Nightscout URL"]))
+            }
+        }
     }
 
     static func createURLRequest(url: String, token: String?, path: String) -> URLRequest? {
@@ -272,6 +282,32 @@ class NightscoutUtils {
             }
         }
         task.resume()
+    }
+
+    /// Effective time of a Nightscout treatment: `timestamp` when present, otherwise `created_at`.
+    /// Uploaders disagree on the value's type (ISO 8601 string, epoch milliseconds, or JSON `null`),
+    /// so never force-cast it; an unreadable value yields `nil` and the entry is skipped.
+    static func treatmentDate(from entry: [String: AnyObject]) -> Date? {
+        for key in ["timestamp", "created_at"] {
+            guard let value = entry[key], !(value is NSNull) else { continue }
+            return parseDateValue(value)
+        }
+        return nil
+    }
+
+    static func parseDateValue(_ value: Any) -> Date? {
+        switch value {
+        case let string as String:
+            return parseDate(string)
+        case let number as NSNumber:
+            // Booleans are NSNumbers too; they are never a date.
+            if CFGetTypeID(number) == CFBooleanGetTypeID() { return nil }
+            let raw = number.doubleValue
+            // Epoch milliseconds are ~1e12; epoch seconds are ~1e9.
+            return Date(timeIntervalSince1970: raw > 1e11 ? raw / 1000 : raw)
+        default:
+            return nil
+        }
     }
 
     static func parseDate(_ rawString: String) -> Date? {

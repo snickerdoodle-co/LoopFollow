@@ -20,8 +20,14 @@ class Storage {
 
     var lfApnsKey = StorageValue<String>(key: "lfApnsKey", defaultValue: "")
     var lfKeyId = StorageValue<String>(key: "lfKeyId", defaultValue: "")
+
+    var hubURL = StorageValue<String>(key: "hubURL", defaultValue: "")
     var bundleId = StorageValue<String>(key: "bundleId", defaultValue: "")
     var user = StorageValue<String>(key: "user", defaultValue: "")
+    /// Remote command types the AID app advertises in its Nightscout profile.
+    var remoteCommands = StorageValue<[String]>(key: "remoteCommands", defaultValue: [])
+    /// Remote command types the Loop build advertises in its devicestatus.
+    var loopRemoteCommands = StorageValue<[String]>(key: "loopRemoteCommands", defaultValue: [])
 
     var maxBolus = SecureStorageValue<HKQuantity>(key: "maxBolus", defaultValue: HKQuantity(unit: .internationalUnit(), doubleValue: 1.0))
     var maxCarbs = SecureStorageValue<HKQuantity>(key: "maxCarbs", defaultValue: HKQuantity(unit: .gram(), doubleValue: 30.0))
@@ -30,6 +36,8 @@ class Storage {
 
     var mealWithBolus = StorageValue<Bool>(key: "mealWithBolus", defaultValue: false)
     var mealWithFatProtein = StorageValue<Bool>(key: "mealWithFatProtein", defaultValue: false)
+    /// Lets the Apple Watch app send remote commands through this phone.
+    var watchRemoteCommands = StorageValue<Bool>(key: "watchRemoteCommands", defaultValue: true)
 
     // TODO: This flag can be deleted in March 2027. Check the commit for other places to cleanup.
     var hasSeenFatProteinOrderChange = StorageValue<Bool>(key: "hasSeenFatProteinOrderChange", defaultValue: true)
@@ -58,8 +66,10 @@ class Storage {
 
     var lastOverrideStartNotified = StorageValue<TimeInterval?>(key: "lastOverrideStartNotified", defaultValue: nil)
     var lastOverrideEndNotified = StorageValue<TimeInterval?>(key: "lastOverrideEndNotified", defaultValue: nil)
+    var lastOverridePreEndNotified = StorageValue<TimeInterval?>(key: "lastOverridePreEndNotified", defaultValue: nil)
     var lastTempTargetStartNotified = StorageValue<TimeInterval?>(key: "lastTempTargetStartNotified", defaultValue: nil)
     var lastTempTargetEndNotified = StorageValue<TimeInterval?>(key: "lastTempTargetEndNotified", defaultValue: nil)
+    var lastTempTargetPreEndNotified = StorageValue<TimeInterval?>(key: "lastTempTargetPreEndNotified", defaultValue: nil)
     var lastRecBolusNotified = StorageValue<Double?>(key: "lastRecBolusNotified", defaultValue: nil)
     var lastCOBNotified = StorageValue<Double?>(key: "lastCOBNotified", defaultValue: nil)
     var lastMissedBolusNotified = StorageValue<Date?>(key: "lastMissedBolusNotified", defaultValue: nil)
@@ -70,6 +80,11 @@ class Storage {
     var colorBGText = StorageValue<Bool>(key: "colorBGText", defaultValue: true)
     var appearanceMode = StorageValue<AppearanceMode>(key: "appearanceMode", defaultValue: .dark)
     var showStats = StorageValue<Bool>(key: "showStats", defaultValue: true)
+    /// Show the home screen stats as a Time in Range band instead of the statistics box.
+    var showTIRBand = StorageValue<Bool>(key: "showTIRBand", defaultValue: false)
+    /// Period both home screen stats (statistics box and Time in Range band) cover:
+    /// the last 24 hours, or today since midnight.
+    var statsSinceMidnight = StorageValue<Bool>(key: "statsSinceMidnight", defaultValue: false)
     var useIFCC = StorageValue<Bool>(key: "useIFCC", defaultValue: false)
     var showSmallGraph = StorageValue<Bool>(key: "showSmallGraph", defaultValue: true)
     var screenlockSwitchState = StorageValue<Bool>(key: "screenlockSwitchState", defaultValue: true)
@@ -115,6 +130,8 @@ class Storage {
     // Live Activity
     var laEnabled = StorageValue<Bool>(key: "laEnabled", defaultValue: false)
     var laRenewBy = StorageValue<TimeInterval>(key: "laRenewBy", defaultValue: 0)
+    /// The activity `laRenewBy` belongs to.
+    var laBoundActivityId = StorageValue<String>(key: "laBoundActivityId", defaultValue: "")
     var laRenewalFailed = StorageValue<Bool>(key: "laRenewalFailed", defaultValue: false)
     var laPushToStartToken = StorageValue<String>(key: "laPushToStartToken", defaultValue: "")
     var laLastPushToStartAt = StorageValue<TimeInterval>(key: "laLastPushToStartAt", defaultValue: 0)
@@ -132,6 +149,11 @@ class Storage {
     var showPriorDayTimeLines = StorageValue<Bool>(key: "showPriorDayTimeMarkers", defaultValue: false)
     var showYesterdayLine = StorageValue<Bool>(key: "showYesterdayLine", defaultValue: false)
     var smallGraphTreatments = StorageValue<Bool>(key: "smallGraphTreatments", defaultValue: true)
+    var showIOBGraph = StorageValue<Bool>(key: "showIOBGraph", defaultValue: false)
+    var showCOBGraph = StorageValue<Bool>(key: "showCOBGraph", defaultValue: false)
+    var showSensitivityRatioGraph = StorageValue<Bool>(key: "showSensitivityRatioGraph", defaultValue: false)
+    var showSmoothedBG = StorageValue<Bool>(key: "showSmoothedBG", defaultValue: false)
+    var historyCurvePlacement = StorageValue<HistoryCurvePlacement>(key: "historyCurvePlacement", defaultValue: .separate)
 
     var smallGraphHeight = StorageValue<Int>(key: "smallGraphHeight", defaultValue: 40)
     var predictionToLoad = StorageValue<Double>(key: "predictionToLoad", defaultValue: 1.0)

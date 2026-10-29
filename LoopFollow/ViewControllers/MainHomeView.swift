@@ -13,6 +13,7 @@ struct MainHomeView: View {
 
     @ObservedObject var showSmallGraph = Storage.shared.showSmallGraph
     @ObservedObject var showStats = Storage.shared.showStats
+    @ObservedObject var showTIRBand = Storage.shared.showTIRBand
     @ObservedObject var hideInfoTable = Storage.shared.hideInfoTable
     @ObservedObject var smallGraphHeight = Storage.shared.smallGraphHeight
     @ObservedObject var url = Storage.shared.url
@@ -21,6 +22,7 @@ struct MainHomeView: View {
 
     var onRefresh: (() -> Void)?
     var onStatsTap: (() -> Void)?
+    var onHubBannerTap: (() -> Void)?
 
     private var timeZoneOverride: String? {
         guard graphTimeZoneEnabled.value,
@@ -34,6 +36,14 @@ struct MainHomeView: View {
     }
 
     var body: some View {
+        VStack(spacing: 0) {
+            HubStatusBanner { onHubBannerTap?() }
+
+            homeContent
+        }
+    }
+
+    private var homeContent: some View {
         VStack(spacing: 8) {
             // Top section: BG display + info table
             HStack(spacing: 10) {
@@ -43,12 +53,6 @@ struct MainHomeView: View {
                     InfoTableView(infoManager: infoManager, timeZoneOverride: timeZoneOverride)
                         .dynamicTypeSize(...DynamicTypeSize.accessibility1)
                         .frame(minWidth: 160, maxWidth: 250)
-                        .overlay(
-                            Rectangle()
-                                .fill(Color(UIColor.darkGray))
-                                .frame(width: 2),
-                            alignment: .leading
-                        )
                 }
             }
             .fixedSize(horizontal: false, vertical: true)
@@ -64,7 +68,11 @@ struct MainHomeView: View {
 
             // Statistics
             if showStats.value {
-                StatsDisplayView(model: statsModel, onTap: onStatsTap)
+                if showTIRBand.value {
+                    TIRBandView(model: statsModel, onTap: onStatsTap)
+                } else {
+                    StatsDisplayView(model: statsModel, onTap: onStatsTap)
+                }
             }
         }
         .padding(8)

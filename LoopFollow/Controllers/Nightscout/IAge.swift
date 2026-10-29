@@ -16,7 +16,7 @@ extension MainViewController {
             "count": "1",
         ]
 
-        NightscoutUtils.executeRequest(eventType: .iage, parameters: parameters) { (result: Result<[iageData], Error>) in
+        NightscoutUtils.executeRequest(eventType: .iage, parameters: parameters, hubPart: .iage) { (result: Result<[iageData], Error>) in
             switch result {
             case let .success(data):
                 DispatchQueue.main.async {
@@ -44,7 +44,7 @@ extension MainViewController {
                                    .withDashSeparatorInDate,
                                    .withColonSeparatorInTime]
 
-        if let iageTime = formatter.date(from: (lastIageString as! String))?.timeIntervalSince1970 {
+        if let iageTime = formatter.date(from: lastIageString)?.timeIntervalSince1970 {
             Storage.shared.iageInsertTime.value = iageTime
             let now = dateTimeUtils.getNowTimeIntervalUTC()
             let secondsAgo = now - iageTime

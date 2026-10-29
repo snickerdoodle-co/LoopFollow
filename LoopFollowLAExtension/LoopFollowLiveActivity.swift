@@ -50,7 +50,8 @@ private func makeDynamicIsland(context: ActivityViewContext<GlucoseLiveActivityA
 struct LoopFollowLiveActivityWidget: Widget {
     var body: some WidgetConfiguration {
         ActivityConfiguration(for: GlucoseLiveActivityAttributes.self) { context in
-            LockScreenFamilyAdaptiveView(state: context.state)
+            LockScreenFamilyAdaptiveView(state: context.state,
+                                         hubStopped: context.isStale && context.state.reason == "hub")
                 .id(context.state.seq)
                 .background(
                     LALivenessMarker(
@@ -75,15 +76,20 @@ struct LoopFollowLiveActivityWidget: Widget {
 /// - everything else → full lock screen layout
 private struct LockScreenFamilyAdaptiveView: View {
     let state: GlucoseLiveActivityAttributes.ContentState
+    /// The last update came from LF Hub and the activity is past its stale date,
+    /// which the hub sets 15 minutes after each update: the hub has stopped sending.
+    let hubStopped: Bool
 
     @Environment(\.activityFamily) private var activityFamily
 
     var body: some View {
         if activityFamily == .small {
             SmallFamilyView(snapshot: state.snapshot)
+                .overlay(alignment: .bottom) { if hubStopped { NotUpdatingBadge(compact: true) } }
                 .activityBackgroundTint(Color.black.opacity(0.25))
         } else {
             LockScreenLiveActivityView(state: state)
+                .overlay(alignment: .bottom) { if hubStopped { NotUpdatingBadge(compact: false).padding(.bottom, 4) } }
                 .activityBackgroundTint(LAColors.backgroundTint(for: state.snapshot))
         }
     }
@@ -214,8 +220,7 @@ private struct LockScreenLiveActivityView: View {
                         .foregroundStyle(.white.opacity(0.80))
                         .lineLimit(1)
                 }
-                .frame(minWidth: 160, maxWidth: 184, alignment: .leading)
-                .layoutPriority(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
 
                 Rectangle()
                     .fill(Color.white.opacity(0.20))
@@ -236,6 +241,16 @@ private struct LockScreenLiveActivityView: View {
             }
 
             ActiveAdjustmentsView(snapshot: s)
+
+            if let sensorState = s.cgmSensorState {
+                Text("CGM: \(sensorState)")
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.8)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity, alignment: .center)
+            }
 
             Text(LAAppGroupSettings.showDisplayName()
                 ? "\(LAAppGroupSettings.displayName()) — \(LAFormat.updated(s))"
@@ -260,10 +275,22 @@ private struct LockScreenLiveActivityView: View {
                         RoundedRectangle(cornerRadius: 16, style: .continuous)
                             .fill(Color(uiColor: UIColor.systemRed).opacity(0.85))
 
-                        Text("Not Looping")
-                            .font(.system(size: 20, weight: .heavy, design: .rounded))
-                            .foregroundStyle(.white)
-                            .tracking(1.5)
+                        VStack(spacing: 4) {
+                            Text("Not Looping")
+                                .font(.system(size: 20, weight: .heavy, design: .rounded))
+                                .foregroundStyle(.white)
+                                .tracking(1.5)
+
+                            if let sensorState = state.snapshot.cgmSensorState {
+                                Text("CGM: \(sensorState)")
+                                    .font(.system(size: 14, weight: .semibold, design: .rounded))
+                                    .foregroundStyle(.white)
+                                    .lineLimit(2)
+                                    .minimumScaleFactor(0.8)
+                                    .multilineTextAlignment(.center)
+                            }
+                        }
+                        .padding(.horizontal, 12)
                     }
                 }
             }
@@ -279,6 +306,20 @@ private struct LockScreenLiveActivityView: View {
             }
             .opacity(state.snapshot.showRenewalOverlay ? 1 : 0)
         )
+    }
+}
+
+/// Shown once an activity LF Hub updates is past its stale date: no update arrived in time.
+private struct NotUpdatingBadge: View {
+    let compact: Bool
+
+    var body: some View {
+        Text(compact ? "Not updating" : "Not updating — open LoopFollow")
+            .font(.system(size: compact ? 10 : 12, weight: .bold, design: .rounded))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 2)
+            .background(Capsule().fill(Color(uiColor: UIColor.systemRed).opacity(0.9)))
     }
 }
 
@@ -322,7 +363,7 @@ private struct MetricBlock: View {
                 .allowsTightening(true)
                 .layoutPriority(1)
         }
-        .frame(width: 72, alignment: .leading)
+        .frame(maxWidth: 72, alignment: .leading)
     }
 }
 
@@ -360,7 +401,7 @@ private struct SlotView: View {
     var body: some View {
         if option == .none {
             Color.clear
-                .frame(width: 72, height: 36)
+                .frame(maxWidth: 72, minHeight: 36, maxHeight: 36)
         } else {
             MetricBlock(label: option.gridLabel, value: slotFormattedValue(option: option, snapshot: snapshot))
         }
@@ -507,16 +548,31 @@ private struct DynamicIslandTrailingView: View {
 private struct DynamicIslandBottomView: View {
     let snapshot: GlucoseSnapshot
 
-    var body: some View {
-        if snapshot.isNotLooping {
-            Text("Loop has not reported in 15+ minutes")
+    @ViewBuilder
+    private var sensorStateText: some View {
+        if let sensorState = snapshot.cgmSensorState {
+            Text("CGM: \(sensorState)")
                 .font(.system(size: 12, weight: .semibold, design: .rounded))
                 .foregroundStyle(.white.opacity(0.92))
                 .lineLimit(1)
                 .minimumScaleFactor(0.75)
+        }
+    }
+
+    var body: some View {
+        if snapshot.isNotLooping {
+            VStack(spacing: 2) {
+                Text("Loop has not reported in 15+ minutes")
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.92))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+                sensorStateText
+            }
         } else {
             VStack(spacing: 2) {
                 ActiveAdjustmentsView(snapshot: snapshot)
+                sensorStateText
                 Text("Updated at: \(LAFormat.updated(snapshot))")
                     .font(.system(size: 13, weight: .semibold, design: .rounded))
                     .foregroundStyle(.white.opacity(0.92))
@@ -779,12 +835,12 @@ private enum LAColors {
         let low = t.low
         let high = t.high
 
-        if mgdl < low {
-            let raw = 0.48 + (0.85 - 0.48) * ((low - mgdl) / (low - 54.0))
+        if mgdl <= low {
+            let raw = 0.48 + (0.85 - 0.48) * ((low - mgdl) / max(low - 54.0, 1))
             let opacity = min(max(raw, 0.48), 0.85)
             return Color(uiColor: UIColor.systemRed).opacity(opacity)
-        } else if mgdl > high {
-            let raw = 0.44 + (0.85 - 0.44) * ((mgdl - high) / (324.0 - high))
+        } else if mgdl >= high {
+            let raw = 0.44 + (0.85 - 0.44) * ((mgdl - high) / max(324.0 - high, 1))
             let opacity = min(max(raw, 0.44), 0.85)
             return Color(uiColor: UIColor.systemOrange).opacity(opacity)
         } else {
@@ -798,9 +854,9 @@ private enum LAColors {
         let low = t.low
         let high = t.high
 
-        if mgdl < low {
+        if mgdl <= low {
             return Color(uiColor: UIColor.systemRed)
-        } else if mgdl > high {
+        } else if mgdl >= high {
             return Color(uiColor: UIColor.systemOrange)
         } else {
             return Color(uiColor: UIColor.systemGreen)

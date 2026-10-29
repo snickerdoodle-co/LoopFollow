@@ -19,6 +19,8 @@ extension MainViewController {
             let latestOverrideEnd = self.overrideGraphData.last { $0.endDate <= now }?.endDate
             let latestTempTargetStart = self.tempTargetGraphData.last { $0.date <= now }?.date
             let latestTempTargetEnd = self.tempTargetGraphData.last { $0.endDate <= now }?.endDate
+            let activeOverrideEnd = self.overrideGraphData.last { $0.date <= now && ($0.scheduledEndDate ?? 0) > now }?.scheduledEndDate
+            let activeTempTargetEnd = self.tempTargetGraphData.last { $0.date <= now && $0.endDate > now }?.scheduledEndDate
             let recBolus = Observable.shared.deviceRecBolus.value
             let COB = self.latestCOB?.value
             let sensorInsertedAt = Storage.shared.sageInsertTime.value
@@ -40,6 +42,8 @@ extension MainViewController {
                 latestOverrideEnd: latestOverrideEnd,
                 latestTempTargetStart: latestTempTargetStart,
                 latestTempTargetEnd: latestTempTargetEnd,
+                activeOverrideEnd: activeOverrideEnd,
+                activeTempTargetEnd: activeTempTargetEnd,
                 recBolus: recBolus,
                 COB: COB,
                 sageInsertTime: sensorInsertedAt,
@@ -94,9 +98,9 @@ extension MainViewController {
         )
     }
 
-    /// Maximum number of forward points (5-minute spacing) the low alarm looks at:
-    /// 12 points = 60 minutes, matching the predictive look-ahead's upper bound.
-    static let alarmForecastPointCap = 12
+    /// Maximum number of points (5-minute spacing) the low alarm looks at:
+    /// enough to reach the longest predictive look-ahead the editor offers.
+    static let alarmForecastPointCap = LowBGCondition.forecastPoints(forMinutes: LowBGCondition.maxPredictiveMinutes)
 
     /// Collapses several forecasts into a single series by taking the **lowest**
     /// value at each point in time, oldest .. newest at 5-minute spacing.
@@ -104,7 +108,8 @@ extension MainViewController {
     /// Trio/OpenAPS reports four forecasts (ZT, IOB, COB, UAM) rather than the
     /// single one Loop provides, so this lets the predictive-low alarm fire if
     /// *any* forecast dips to or below the threshold. Empty forecasts are ignored,
-    /// and each point uses whichever forecasts still extend that far.
+    /// and each point uses whichever forecasts still extend that far, so one short
+    /// forecast does not shorten the look-ahead.
     static func lowestForecast(
         forecasts: [[Double]],
         start: TimeInterval,

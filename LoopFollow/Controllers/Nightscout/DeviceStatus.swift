@@ -8,7 +8,7 @@ import SwiftUI
 extension MainViewController {
     func webLoadNSDeviceStatus() {
         let parameters = ["count": "1"]
-        NightscoutUtils.executeDynamicRequest(eventType: .deviceStatus, parameters: parameters) { result in
+        NightscoutUtils.executeDynamicRequest(eventType: .deviceStatus, parameters: parameters, hubPart: .devicestatus) { result in
             switch result {
             case let .success(json):
                 if let jsonDeviceStatus = json as? [[String: AnyObject]] {
@@ -67,7 +67,7 @@ extension MainViewController {
     func updateDeviceStatusDisplay(jsonDeviceStatus: [[String: AnyObject]]) {
         let previousIOBText = Observable.shared.iobText.value
         let previousDeviceWasLoop = Storage.shared.device.value == "Loop"
-        infoManager.clearInfoData(types: [.iob, .cob, .battery, .pump, .pumpBattery, .target, .isf, .carbRatio, .updated, .recBolus, .tdd])
+        infoManager.clearInfoData(types: [.iob, .cob, .battery, .pump, .pumpBattery, .target, .isf, .carbRatio, .updated, .recBolus, .tdd, .smoothedBG])
 
         // For Loop, clear the current override here - For Trio, it is handled using treatments
         if Storage.shared.device.value == "Loop" {
@@ -146,6 +146,14 @@ extension MainViewController {
             {
                 infoManager.updateInfoData(type: .pumpBattery, value: String(format: "%.0f", pumpBatteryPercent) + "%", numericValue: pumpBatteryPercent)
                 Observable.shared.pumpBatteryLevel.value = pumpBatteryPercent
+                latestPumpBatteryDate = Date()
+            } else if let lastPercent = Observable.shared.pumpBatteryLevel.value,
+                      let lastDate = latestPumpBatteryDate,
+                      Date().timeIntervalSince(lastDate) <= 60 * 60
+            {
+                // Some records leave out the pump battery, and the level changes
+                // slowly, so the last reading is shown for up to an hour.
+                infoManager.updateInfoData(type: .pumpBattery, value: String(format: "%.0f", lastPercent) + "%", numericValue: lastPercent)
             }
 
             if let uploader = lastDeviceStatus?["uploader"] as? [String: AnyObject],
@@ -261,10 +269,12 @@ extension MainViewController {
 
         evaluateNotLooping()
 
+        DeviceStatusHistory.shared.ingestLatest(lastDeviceStatus)
+
         // Mark device status as loaded for initial loading state
         markDataLoaded("deviceStatus")
 
-        if Storage.shared.contactEnabled.value, Storage.shared.contactIOB.value != .off,
+        if Storage.shared.contactEnabled.value, !HubClient.shared.isHubMode, Storage.shared.contactIOB.value != .off,
            Observable.shared.iobText.value != previousIOBText
         {
             contactImageUpdater.updateContactImage(

@@ -11,6 +11,15 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     func application(_: UIApplication, didFinishLaunchingWithOptions _: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         LogManager.shared.log(category: .general, message: "App started")
         LogManager.shared.cleanupOldLogs()
+        ExitDiagnostics.shared.start()
+        HubClient.shared.observeChanges()
+        HubAlarmSnoozeBridge.shared.setHandler { @MainActor alarmID in
+            let known = Storage.shared.alarms.value.contains(where: { $0.id == alarmID })
+            LogManager.shared.log(category: .alarm, message: "System alarm snooze tapped for \(alarmID) (known=\(known), current=\(Observable.shared.currentAlarm.value?.uuidString ?? "nil"))")
+            guard known else { return }
+            Observable.shared.currentAlarm.value = alarmID
+            AlarmManager.shared.performSnooze()
+        }
 
         // Notification and calendar permissions are no longer requested here.
         // They're deferred to the moment the user opts into the feature that
@@ -49,11 +58,11 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
             }
         }
 
-        let action = UNNotificationAction(identifier: "OPEN_APP_ACTION", title: "Open App", options: .foreground)
-        let category = UNNotificationCategory(identifier: BackgroundAlertIdentifier.categoryIdentifier, actions: [action], intentIdentifiers: [], options: [])
-        UNUserNotificationCenter.current().setNotificationCategories([category])
+        AlarmManager.registerNotificationCategories()
 
         UNUserNotificationCenter.current().delegate = self
+
+        WatchSessionManager.shared.activate()
 
         // Only spin up Bluetooth if the user has chosen a BLE-based background
         // refresh. Initializing BLEManager creates a CBCentralManager, which
@@ -109,6 +118,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     }
 
     func applicationWillTerminate(_: UIApplication) {
+        LogManager.shared.log(category: .general, message: "App will terminate (\(ExitDiagnostics.memoryDescription()))")
         #if !targetEnvironment(macCatalyst)
             LiveActivityManager.shared.endOnTerminate()
         #endif
@@ -121,6 +131,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         let tokenString = deviceToken.map { String(format: "%02.2hhx", $0) }.joined()
 
         Observable.shared.loopFollowDeviceToken.value = tokenString
+        Task { await HubClient.shared.sync() }
 
         LogManager.shared.log(category: .apns, message: "Successfully registered for remote notifications with token: \(LogRedactor.tail(tokenString))")
     }
@@ -134,6 +145,12 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     func application(_: UIApplication, didReceiveRemoteNotification userInfo: [AnyHashable: Any], fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void) {
         let userInfoKeys = userInfo.keys.compactMap { $0 as? String }.sorted()
         LogManager.shared.log(category: .apns, message: "Received remote notification: keys=\(userInfoKeys)")
+        RemoteCommandTracker.shared.handleNotification(userInfo: userInfo)
+
+        if let sent = (userInfo["lfhubHeartbeat"] as? NSNumber)?.doubleValue {
+            let delay = Int(Date().timeIntervalSince1970 - sent)
+            LogManager.shared.log(category: .hub, message: "Hub heartbeat arrived \(delay) s after it was sent (app state \(UIApplication.shared.applicationState.rawValue))")
+        }
 
         // Check if this is a response notification from Loop or Trio
         if let aps = userInfo["aps"] as? [String: Any] {
@@ -183,10 +200,18 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     }
 
     func userNotificationCenter(_: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {
+        RemoteCommandTracker.shared.handleNotification(userInfo: response.notification.request.content.userInfo)
+
         if response.actionIdentifier == "OPEN_APP_ACTION" {
             // Dismiss any presented modal/sheet so the user actually sees Home
             UIApplication.shared.topMost?.dismiss(animated: true)
             Observable.shared.selectedTabIndex.value = 0
+        }
+
+        if let hubAlarm = response.notification.request.content.userInfo["lfhubAlarmId"] as? String,
+           let alarmID = UUID(uuidString: hubAlarm)
+        {
+            HubClient.shared.adoptHubAlarm(alarmID)
         }
 
         if response.actionIdentifier == "snooze" {
@@ -267,17 +292,33 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void)
     {
         let content = notification.request.content
+        RemoteCommandTracker.shared.handleNotification(userInfo: content.userInfo)
         let userInfoKeys = content.userInfo.keys.compactMap { $0 as? String }.sorted()
         LogManager.shared.log(
             category: .general,
             message: "Will present notification: keys=\(userInfoKeys), interruption=\(content.interruptionLevel.rawValue), title=\(content.title.isEmpty ? "empty" : "set"), body=\(content.body.isEmpty ? "empty" : "set")"
         )
 
+        // The hub stopped an alarm: whether it still counts as sounding is the hub's to say.
+        if content.userInfo["lfhubStopAlarmId"] != nil {
+            Task { await HubClient.shared.refreshStatus() }
+        }
+
         // Suppress notifications iOS routes here that we never intended to surface:
         // the Live Activity push-to-start uses interruption-level: passive with empty
         // title/body and must not produce a banner or sound when LF is foregrounded.
         if content.interruptionLevel == .passive || (content.title.isEmpty && content.body.isEmpty) {
             completionHandler([])
+            return
+        }
+
+        if let hubAlarm = content.userInfo["lfhubAlarmId"] as? String, let alarmID = UUID(uuidString: hubAlarm) {
+            HubClient.shared.adoptHubAlarm(alarmID)
+        }
+
+        // The hub's Speak BG: the app on screen shows the reading, so only the speech plays.
+        if content.userInfo["lfhubSpeak"] != nil {
+            completionHandler([.sound, .list])
             return
         }
 
