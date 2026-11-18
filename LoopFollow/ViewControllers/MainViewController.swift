@@ -74,6 +74,7 @@ class MainViewController: UIViewController, UNUserNotificationCenterDelegate {
     var basalProfile: [basalProfileStruct] = []
     var basalData: [basalGraphStruct] = []
     var basalScheduleData: [basalGraphStruct] = []
+    var targetScheduleData: [targetGraphStruct] = []
     var bolusData: [bolusGraphStruct] = []
     var smbData: [bolusGraphStruct] = []
     var carbData: [carbGraphStruct] = []
@@ -86,6 +87,9 @@ class MainViewController: UIViewController, UNUserNotificationCenterDelegate {
     var statsBasalData: [basalGraphStruct] = []
     var overrideGraphData: [DataStructs.overrideStruct] = []
     var tempTargetGraphData: [DataStructs.tempTargetStruct] = []
+    var untetheredGraphData: [DataStructs.untetheredStruct] = []
+    /// G7 readings the sensor marked unreliable (Trio's "Unreliable Glucose" treatments), oldest first: hollow dots.
+    var unreliableGraphData: [ShareGlucoseData] = []
     var predictionData: [ShareGlucoseData] = []
     var ztPredictionData: [ShareGlucoseData] = []
     var iobPredictionData: [ShareGlucoseData] = []
@@ -300,8 +304,11 @@ class MainViewController: UIViewController, UNUserNotificationCenterDelegate {
             .sink { [weak self] _ in
                 self?.updateBGGraphSettings()
                 self?.updateBGGraph()
-                LiveActivityManager.shared.refreshFromCurrentState(reason: "range mode changed")
                 self?.updateStats()
+                #if !targetEnvironment(macCatalyst)
+                    // Recolor the Live Activity for the new range right away.
+                    LiveActivityManager.shared.refreshFromCurrentState(reason: LiveActivityManager.rangeModeChangedReason)
+                #endif
             }
             .store(in: &cancellables)
 
@@ -599,6 +606,10 @@ class MainViewController: UIViewController, UNUserNotificationCenterDelegate {
     }
 
     @objc func appMovedToBackground() {
+        // Redraw the home screen widget: free while the app is in the foreground,
+        // and it revives a widget whose timeline ran out.
+        WidgetBGStore.reloadWidget()
+
         LogManager.shared.log(
             category: .general,
             message: "App moved to background (refreshType=\(Storage.shared.backgroundRefreshType.value.rawValue), lowPowerMode=\(ProcessInfo.processInfo.isLowPowerModeEnabled), backgroundRefreshStatus=\(Self.describe(UIApplication.shared.backgroundRefreshStatus)), \(ExitDiagnostics.memoryDescription()))"
@@ -614,6 +625,28 @@ class MainViewController: UIViewController, UNUserNotificationCenterDelegate {
 
         NightscoutSocketManager.shared.disconnect()
         HubBundle.shared.stopListening()
+        ringHubAlarmsAgain()
+    }
+
+    /// iOS takes a ringing system alarm's banner away when the app leaves the screen,
+    /// and the alarm sounds on without a button to stop it; the hub alarms that sound
+    /// are rung again so they get it back.
+    private func ringHubAlarmsAgain() {
+        #if !targetEnvironment(macCatalyst)
+            guard #available(iOS 26, *) else { return }
+            HubAlarmKit.setOnScreen(false)
+            let time = HubClient.BackgroundTime(name: "Ring hub alarms again")
+            Task {
+                let (count, failures) = await HubAlarmKit.ringSoundingAgain()
+                if count > 0 {
+                    LogManager.shared.log(category: .alarm, message: "Rang \(count) sounding hub alarm(s) again on leaving the screen")
+                }
+                for failure in failures {
+                    LogManager.shared.log(category: .alarm, message: "Hub alarm not rung again on leaving the screen: \(failure)")
+                }
+                time.end()
+            }
+        #endif
     }
 
     /// Starts what the mode in effect uses in the background: the Silent Tune and the
@@ -666,12 +699,6 @@ class MainViewController: UIViewController, UNUserNotificationCenterDelegate {
         //   2. Update any other StorageValue defaults in Storage.swift that this new step
         //      mutates, so a fresh install ends up in the same state as a migrated user.
 
-        // Step 2: Released in v3.1.0 (2025-07-21). Can be removed after 2026-07-21.
-        if Storage.shared.migrationStep.value < 2 {
-            Storage.shared.migrateStep2()
-            Storage.shared.migrationStep.value = 2
-        }
-
         // Step 3: Released in v4.5.0 (2026-02-01). Can be removed after 2027-02-01.
         if Storage.shared.migrationStep.value < 3 {
             Storage.shared.migrateStep3()
@@ -692,26 +719,31 @@ class MainViewController: UIViewController, UNUserNotificationCenterDelegate {
             Storage.shared.migrationStep.value = 5
         }
 
+        // Step 6: Released in v6.0.0 (2026-04-25). Can be removed after 2027-04-25.
         if Storage.shared.migrationStep.value < 6 {
             Storage.shared.migrateStep6()
             Storage.shared.migrationStep.value = 6
         }
 
+        // Step 7: Released in v6.0.0 (2026-04-25). Can be removed after 2027-04-25.
         if Storage.shared.migrationStep.value < 7 {
             Storage.shared.migrateStep7()
             Storage.shared.migrationStep.value = 7
         }
 
+        // Step 8: Released in v6.1.0 (2026-05-05). Can be removed after 2027-05-05.
         if Storage.shared.migrationStep.value < 8 {
             Storage.shared.migrateStep8()
             Storage.shared.migrationStep.value = 8
         }
 
+        // Step 9: Released in v7.0.0 (2026-07-25). Can be removed after 2027-07-25.
         if Storage.shared.migrationStep.value < 9 {
             Storage.shared.migrateStep9()
             Storage.shared.migrationStep.value = 9
         }
 
+        // Step 10: Released in v7.0.0 (2026-07-25). Can be removed after 2027-07-25.
         if Storage.shared.migrationStep.value < 10 {
             Storage.shared.migrateStep10()
             Storage.shared.migrationStep.value = 10
@@ -719,6 +751,9 @@ class MainViewController: UIViewController, UNUserNotificationCenterDelegate {
     }
 
     @objc func appDidBecomeActive() {
+        #if !targetEnvironment(macCatalyst)
+            if #available(iOS 26, *) { HubAlarmKit.setOnScreen(true) }
+        #endif
         // applicationState == .active is guaranteed here, so the BFU guard in
         // runMigrationsIfNeeded() will always pass. Catches the case where viewDidLoad
         // ran during a BGAppRefreshTask background launch and deferred migrations.
@@ -763,6 +798,10 @@ class MainViewController: UIViewController, UNUserNotificationCenterDelegate {
     }
 
     @objc func appCameToForeground() {
+        // Redraw the home screen widget: free while the app is in the foreground,
+        // and it revives a widget whose timeline ran out.
+        WidgetBGStore.reloadWidget()
+
         LogManager.shared.log(category: .general, message: "App came to foreground")
 
         // BFU recovery (StorageReadiness.recover) is driven by AppDelegate before this
@@ -917,13 +956,12 @@ class MainViewController: UIViewController, UNUserNotificationCenterDelegate {
             let latestBG = bgData[bgData.count - 1].sgv
             if Storage.shared.colorBGText.value {
                 let thresholds = UnitSettingsStore.shared.effectiveThresholds()
-                if Double(latestBG) >= thresholds.high {
-                    Observable.shared.bgTextColor.value = .yellow
-                } else if Double(latestBG) <= thresholds.low {
-                    Observable.shared.bgTextColor.value = .red
-                } else {
-                    Observable.shared.bgTextColor.value = .green
-                }
+                Observable.shared.bgTextColor.value = dynamicGlucoseColor(
+                    glucoseValue: Double(latestBG),
+                    low: thresholds.low,
+                    target: thresholds.target,
+                    high: thresholds.high
+                )
             } else {
                 Observable.shared.bgTextColor.value = .primary
             }

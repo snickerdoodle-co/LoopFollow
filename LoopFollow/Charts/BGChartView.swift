@@ -815,8 +815,14 @@ private struct MainBGChart: View {
     }
 
     /// Pill entry for a BG reading. Shared by the scrub lookup and the tap hit test.
+    /// Time leads the entry, then the label and value, so the pill reads "when, then what".
     private func bgPillText(for point: BGChartModel.BGPoint) -> String {
-        "BG\n\(Localizer.toDisplayUnits(String(Int(point.value))))\n\(model.pillTimeString(for: point.date))"
+        "\(model.pillTimeString(for: point.date))\n\(point.isManual ? "★ Manual BG" : "BG")\n\(Localizer.toDisplayUnits(String(Int(point.value))))"
+    }
+
+    /// A reading the G7 marked unreliable: its warning in place of "BG".
+    private func unreliablePillText(for point: BGChartModel.BGPoint) -> String {
+        "\(model.pillTimeString(for: point.date))\n⚠︎ not reliable\n\(Localizer.toDisplayUnits(String(Int(point.value))))"
     }
 
     private func bandPillTexts(at date: Date) -> [String] {
@@ -831,6 +837,9 @@ private struct MainBGChart: View {
             .filter({ date >= $0.start && date <= $0.end })
             .max(by: { $0.start < $1.start })
         {
+            texts.append(band.pillText)
+        }
+        if let band = model.untethered.last(where: { date >= $0.start && date <= $0.end }) {
             texts.append(band.pillText)
         }
         return texts
@@ -862,16 +871,24 @@ private struct MainBGChart: View {
                 return SelectionAnchor(date: date, value: midY, texts: [band.pillText], detail: band.detail)
             }
         }
+        for band in model.untethered where date >= band.start && date <= band.end {
+            if value >= band.yBottom, value <= band.yTop {
+                let midY = (band.yTop + band.yBottom) / 2
+                return SelectionAnchor(date: date, value: midY, texts: [band.pillText], detail: band.detail)
+            }
+        }
         return nil
     }
 
     /// Scrub lookup (time-only). The finger resolves to the grid mark whose
     /// block contains the scrub time (see BGChartScrubSlots); the indicator
-    /// stands on the mark. The pill stacks every treatment in the block, then
-    /// every BG reading in it, then any band at the mark, so it is constant
-    /// across the block. The indicator's height comes from the reading nearest
-    /// the mark, else the nearest treatment, else the band; an empty block
-    /// shows nothing.
+    /// stands on the mark. A tap stacks every BG reading in the block first
+    /// (each already time-first, see bgPillText), then every treatment in it,
+    /// then any band at the mark. While scrubbing, the BG display and info
+    /// table show the values at the scrubbed time, so the pill leaves out the
+    /// readings. The pill is constant across the block. The indicator's height
+    /// comes from the reading nearest the mark, else the nearest treatment,
+    /// else the band; an empty block shows nothing.
     private enum SelectionPurpose {
         /// Press-and-hold scrubbing: how things were at that time.
         case scrub
@@ -889,11 +906,18 @@ private struct MainBGChart: View {
         }
         treatments.sort { $0.date < $1.date }
         let readings = model.bg.filter { slot.contains($0.date) }
+        // readings the G7 marked unreliable: listed after the reliable ones, and on a scrub shown in the pill
+        // where no reliable reading is, since the BG display has nothing for that time
+        let unreliable = model.unreliable.filter { slot.contains($0.date) }
         let bandTexts = bandPillTexts(at: mark)
 
         // Scrubbing shows no pill: the BG display and info table show the
-        // values at the scrubbed time. A tap lists what happened there.
-        let texts = purpose == .tap ? treatments.map(\.pillText) + readings.map(bgPillText) + bandTexts : []
+        // values at the scrubbed time. A tap lists what happened there: the
+        // readings first (see bgPillText), then whatever treatments -- an SMB,
+        // a bolus, etc. -- fall in the same block, then any band.
+        let texts = purpose == .tap
+            ? readings.map(bgPillText) + unreliable.map(unreliablePillText) + treatments.map(\.pillText) + bandTexts
+            : (readings.isEmpty ? unreliable.map(unreliablePillText) : [])
 
         func distanceToMark(_ date: Date) -> TimeInterval { abs(date.timeIntervalSince(mark)) }
 
@@ -901,6 +925,8 @@ private struct MainBGChart: View {
         let nearestReading = readings.min(by: { distanceToMark($0.date) < distanceToMark($1.date) })
         if let reading = nearestReading {
             value = reading.value
+        } else if let nearest = unreliable.min(by: { distanceToMark($0.date) < distanceToMark($1.date) }) {
+            value = nearest.value
         } else if let nearest = treatments.min(by: { distanceToMark($0.date) < distanceToMark($1.date) }) {
             value = nearest.sgv
         } else if !bandTexts.isEmpty {
@@ -937,6 +963,10 @@ private struct MainBGChart: View {
         if best == nil {
             for p in model.bg {
                 consider(p.date, p.value, bgPillText(for: p), isReading: true)
+            }
+            // the hollow dots the G7 marked unreliable
+            for p in model.unreliable {
+                consider(p.date, p.value, unreliablePillText(for: p))
             }
         }
         if best == nil {
@@ -1021,7 +1051,7 @@ private struct MainBGChart: View {
             let visibleStart = interaction.scrollPosition
             let visibleEnd = interaction.scrollPosition.addingTimeInterval(interaction.visibleSeconds)
 
-            ForEach(model.overrides.filter { $0.end >= visibleStart && $0.start <= visibleEnd }) { band in
+            ForEach((model.overrides + model.untethered).filter { $0.end >= visibleStart && $0.start <= visibleEnd }) { band in
                 let visibleBandStart = max(band.start, visibleStart)
                 let visibleBandEnd = min(band.end, visibleEnd)
                 let xStart = xPosition(for: visibleBandStart, viewportWidth: viewportWidth)
@@ -1269,6 +1299,7 @@ private struct BGChartCanvas: View, Equatable {
                 bgBandMarks
                 basalMarks
                 scheduledBasalMarks
+                scheduledTargetMarks
             }
             coneMarks
             if !isSmall {
@@ -1393,7 +1424,7 @@ private struct BGChartCanvas: View, Equatable {
                 yStart: .value("yBottom", band.yBottom),
                 yEnd: .value("yTop", band.yTop)
             )
-            .foregroundStyle(model.overrideColor.opacity(0.6))
+            .foregroundStyle(band.color.opacity(0.6))
         }
 
         ForEach(model.tempTargets.filter { $0.end >= windowStart && $0.start <= windowEnd }) { band in
@@ -1403,7 +1434,17 @@ private struct BGChartCanvas: View, Equatable {
                 yStart: .value("yBottom", band.yBottom),
                 yEnd: .value("yTop", band.yTop)
             )
-            .foregroundStyle(model.tempTargetColor.opacity(0.5))
+            .foregroundStyle(band.color.opacity(0.5))
+        }
+
+        ForEach(model.untethered.filter { $0.end >= windowStart && $0.start <= windowEnd }) { band in
+            RectangleMark(
+                xStart: .value("start", band.start),
+                xEnd: .value("end", band.end),
+                yStart: .value("yBottom", band.yBottom),
+                yEnd: .value("yTop", band.yTop)
+            )
+            .foregroundStyle(band.color.opacity(0.6))
         }
     }
 
@@ -1430,6 +1471,19 @@ private struct BGChartCanvas: View, Equatable {
             )
             .lineStyle(StrokeStyle(lineWidth: 2, dash: [10, 5]))
             .foregroundStyle(Color.blue.opacity(0.8))
+        }
+    }
+
+    @ChartContentBuilder
+    private var scheduledTargetMarks: some ChartContent {
+        ForEach(windowedLine(model.targetScheduled) { $0.date }) { pt in
+            LineMark(
+                x: .value("time", pt.date),
+                y: .value("target", pt.value),
+                series: .value("series", "targetScheduled")
+            )
+            .lineStyle(StrokeStyle(lineWidth: 2, dash: [10, 5]))
+            .foregroundStyle(Color.green.opacity(0.8))
         }
     }
 
@@ -1486,7 +1540,7 @@ private struct BGChartCanvas: View, Equatable {
     @ChartContentBuilder
     private var bgPointsMark: some ChartContent {
         if model.showDots {
-            ForEach(windowed(model.bg) { $0.date }) { pt in
+            ForEach(windowed(model.bg.filter { !$0.isManual }) { $0.date }) { pt in
                 PointMark(
                     x: .value("time", pt.date),
                     y: .value("bg", pt.value)
@@ -1494,6 +1548,29 @@ private struct BGChartCanvas: View, Equatable {
                 .symbolSize(isSmall ? 14 : 30)
                 .foregroundStyle(pt.color)
             }
+        }
+        // readings entered by hand (finger prick), also with dots off: a star, so they never read as CGM ones
+        ForEach(windowed(model.bg.filter(\.isManual)) { $0.date }) { pt in
+            PointMark(
+                x: .value("time", pt.date),
+                y: .value("bg", pt.value)
+            )
+            .symbol {
+                Image(systemName: "star.fill")
+                    .font(.system(size: isSmall ? 7 : 11))
+                    .foregroundStyle(pt.color)
+            }
+        }
+        // readings the G7 marked unreliable, also with dots off: hollow, so they never read as real ones
+        ForEach(windowed(model.unreliable) { $0.date }) { pt in
+            PointMark(
+                x: .value("time", pt.date),
+                y: .value("bg", pt.value)
+            )
+            // the size of the normal dots, only hollow
+            .symbol(.circle.strokeBorder(lineWidth: 1.5))
+            .symbolSize(isSmall ? 14 : 30)
+            .foregroundStyle(pt.color)
         }
     }
 

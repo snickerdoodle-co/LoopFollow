@@ -2,6 +2,7 @@
 // AlarmManager.swift
 
 import Foundation
+import UIKit
 import UserNotifications
 
 class AlarmManager {
@@ -43,8 +44,19 @@ class AlarmManager {
         evaluators = dict
     }
 
-    func checkAlarms(data: AlarmData) {
+    @MainActor func checkAlarms(data: AlarmData) {
+        // Don't evaluate against stale pre-unlock state before the BFU reload runs.
+        if Storage.shared.needsBFUReload {
+            LogManager.shared.log(category: .alarm, message: "Skipping alarm check — BFU reload pending", isDebug: true)
+            return
+        }
+
         let now = Date()
+        #if !targetEnvironment(macCatalyst)
+            if #available(iOS 26, *), UIApplication.shared.applicationState == .active {
+                HubAlarmKit.setOnScreen(true)
+            }
+        #endif
         var alarmTriggered = false
 
         // No alarm activity while onboarding is on screen — existing or
@@ -61,7 +73,7 @@ class AlarmManager {
         // Honor the "Snooze All" setting. If active, stop any current alarm and exit.
         if let snoozeUntil = config.snoozeUntil, snoozeUntil > now {
             if Observable.shared.currentAlarm.value != nil {
-                stopAlarm()
+                stopAlarm(reportToHub: true)
             }
             return
         }
@@ -78,7 +90,7 @@ class AlarmManager {
                 if Observable.shared.alarmSoundPlaying.value {
                     AlarmSound.stop()
                 }
-                if !MainActor.assumeIsolated({ HubClient.shared.isAdopted(current) }) {
+                if !HubClient.shared.isAdopted(current) {
                     Observable.shared.currentAlarm.value = nil
                     Observable.shared.currentAlarmTitleOverride.value = nil
                 }
@@ -140,7 +152,7 @@ class AlarmManager {
                 if Observable.shared.currentAlarm.value == alarm.id {
                     LogManager.shared.log(category: .alarm, message: "Stopping alarm \(alarm) because it no longer meets its requirements", isDebug: true)
 
-                    stopAlarm(reportToHub: false)
+                    stopAlarm()
                 }
 
                 continue
@@ -204,13 +216,13 @@ class AlarmManager {
                 Storage.shared.alarms.value = alarms
             }
             Observable.shared.alarmSoundPlaying.value = false
-            stopAlarm()
+            stopAlarm(reportToHub: true)
         }
     }
 
     /// Stops the current alarm. With `reportToHub`, in Hub mode its system alarm stops
     /// too and the hub takes it as handled here.
-    func stopAlarm(reportToHub: Bool = true) {
+    func stopAlarm(reportToHub: Bool = false) {
         // A hub-delivered alarm also rings as a system alarm and repeats at the hub.
         if reportToHub, let alarmID = Observable.shared.currentAlarm.value, HubClient.shared.isHubMode {
             #if !targetEnvironment(macCatalyst)

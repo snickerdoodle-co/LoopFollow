@@ -39,8 +39,16 @@ struct WatchState: Codable, Equatable {
     var device: String
     /// The alarm currently sounding on the phone.
     var alarm: WatchAlarm?
+    /// While all alarms are snoozed on the phone (its "Snooze all"): until when.
+    var snoozeAllUntil: Date? = nil
     /// Present when remote commands from the watch are enabled on the phone.
     var remote: WatchRemoteConfig?
+    /// The app icon picked on the phone (an `AppIconOption` name such as "Mint"), for the
+    /// watch's icon complication; nil from a phone that doesn't send it.
+    var appIcon: String? = nil
+    /// G7 readings the sensor marked unreliable (Trio's "Unreliable Glucose" treatments), mg/dL, oldest first:
+    /// hollow orange dots, never used as BG; nil from a phone that doesn't send them.
+    var unreliable: [WatchReading]? = nil
 
     func encoded() -> Data? {
         try? JSONEncoder().encode(self)

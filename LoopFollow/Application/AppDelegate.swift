@@ -81,6 +81,20 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 
         BackgroundRefreshManager.shared.register()
 
+        // Detect Before-First-Unlock launch. isProtectedDataAvailable returns false
+        // for ANY locked-screen background launch, not only post-reboot. Standard
+        // UserDefaults use NSFileProtectionCompleteUntilFirstUserAuthentication —
+        // they stay readable after the first unlock even when the screen is locked.
+        // True BFU (boot before first unlock) is the only case where UserDefaults
+        // is actually inaccessible; in that state every StorageValue reads as its
+        // default — including migrationStep, which is always ≥ 1 for existing users.
+        // Guard against false positives by checking that migrationStep is still 0
+        // (its default), meaning the real value couldn't be read from disk.
+        let protectedDataUnavailable = !UIApplication.shared.isProtectedDataAvailable
+        let bfu = protectedDataUnavailable && Storage.shared.migrationStep.value == 0
+        Storage.shared.needsBFUReload = bfu
+        LogManager.shared.log(category: .general, message: "BFU check: isProtectedDataAvailable=\(!protectedDataUnavailable), migrationStep=\(Storage.shared.migrationStep.value), needsBFUReload=\(bfu)")
+
         // Telemetry mutates rolling history (coldLaunches7d), so defer past a BFU
         // window — poisoned defaults would discard real history. Runs synchronously
         // on a normal launch.
@@ -203,7 +217,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
             Observable.shared.selectedTabIndex.value = 0
         }
 
-        if let hubAlarm = response.notification.request.content.userInfo["lfhubAlarmId"] as? String,
+        if HubClient.shared.drivesAlarms || response.actionIdentifier == "snooze",
+           let hubAlarm = response.notification.request.content.userInfo["lfhubAlarmId"] as? String,
            let alarmID = UUID(uuidString: hubAlarm)
         {
             HubClient.shared.adoptHubAlarm(alarmID)
@@ -310,7 +325,8 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
         // Suppress notifications iOS routes here that we never intended to surface:
         // the Live Activity push-to-start uses interruption-level: passive with empty
         // title/body and must not produce a banner or sound when LF is foregrounded.
-        // The hub's badge push is also silent, so only its badge is applied.
+        // The hub's badge push is empty too: its badge is still applied, since the app
+        // leaves the badge to the hub.
         if content.interruptionLevel == .passive || (content.title.isEmpty && content.body.isEmpty) {
             completionHandler(content.badge != nil ? [.badge] : [])
             return
@@ -319,6 +335,16 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
         // The hub's Speak BG: the app on screen shows the reading, so only the speech plays.
         if content.userInfo["lfhubSpeak"] != nil {
             completionHandler([.sound, .list])
+            return
+        }
+
+        // Trio's answers and "No Confirmation From Trio" stay in Notification Center too: with LoopFollow on screen
+        // the banner goes by in seconds while the remote screen still says to wait for a notification (7 November:
+        // two notices shown at 17:11 and 17:13, neither noticed, and nothing left to find afterwards)
+        if content.userInfo["command_status"] != nil
+            || notification.request.identifier.hasPrefix(TrioAnswerWatch.notificationPrefix)
+        {
+            completionHandler([.banner, .list, .sound, .badge])
             return
         }
 

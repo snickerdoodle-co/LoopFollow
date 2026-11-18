@@ -209,7 +209,7 @@ final class LiveActivityManager {
         let provider = StorageCurrentGlucoseStateProvider()
         guard let snapshot = GlucoseSnapshotBuilder.build(from: provider) else { return }
 
-        writeThresholds()
+        Self.writeRangeModeThresholds()
         GlucoseSnapshotStore.shared.save(snapshot)
 
         seq += 1
@@ -687,7 +687,7 @@ final class LiveActivityManager {
 
         let provider = StorageCurrentGlucoseStateProvider()
         if let snapshot = GlucoseSnapshotBuilder.build(from: provider) {
-            writeThresholds()
+            Self.writeRangeModeThresholds()
             LAAppGroupSettings.setDisplayName(
                 Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "LoopFollow",
                 show: Storage.shared.showDisplayName.value
@@ -695,6 +695,20 @@ final class LiveActivityManager {
             GlucoseSnapshotStore.shared.save(snapshot)
         }
         startIfNeeded()
+    }
+
+    static let rangeModeChangedReason = "range mode changed"
+
+    /// Writes the low/high/target of the selected Range Mode (TIR, TITR, TING or
+    /// Custom) for the Live Activity, so it colors readings like the chart, BG value
+    /// and home screen widget instead of always using the Custom lines.
+    static func writeRangeModeThresholds() {
+        let thresholds = UnitSettingsStore.shared.effectiveThresholds()
+        LAAppGroupSettings.setThresholds(
+            lowMgdl: thresholds.low,
+            highMgdl: thresholds.high,
+            targetMgdl: thresholds.target
+        )
     }
 
     func refreshFromCurrentState(reason: String) {
@@ -1079,12 +1093,6 @@ final class LiveActivityManager {
         }
     }
 
-    /// Publishes the range for the selected time-in-range mode, matching the chart and BG header.
-    private func writeThresholds() {
-        let thresholds = UnitSettingsStore.shared.effectiveThresholds()
-        LAAppGroupSettings.setThresholds(lowMgdl: thresholds.low, highMgdl: thresholds.high)
-    }
-
     private func performRefresh(reason: String) {
         let provider = StorageCurrentGlucoseStateProvider()
         guard let snapshot = GlucoseSnapshotBuilder.build(from: provider) else {
@@ -1109,10 +1117,9 @@ final class LiveActivityManager {
         let forceRefreshNeeded = timeSinceLastUpdate >= 5 * 60
         // Capture dedup result BEFORE saving so the store comparison is valid.
         let snapshotUnchanged = GlucoseSnapshotStore.shared.load() == snapshot
-        let thresholdsChanged = LAAppGroupSettings.thresholdsMgdl() != UnitSettingsStore.shared.effectiveThresholds()
 
         // Store: always update, independent of LA state.
-        writeThresholds()
+        Self.writeRangeModeThresholds()
         GlucoseSnapshotStore.shared.save(snapshot)
 
         // LA update: gated on LA being active, snapshot having changed, and activities enabled.
@@ -1124,7 +1131,9 @@ final class LiveActivityManager {
             LogManager.shared.log(category: .general, message: "[LA] refresh: LA update skipped — dismissedByUser=true reason=\(reason)")
             return
         }
-        guard !snapshotUnchanged || thresholdsChanged || forceRefreshNeeded else { return }
+        // A Range Mode change recolors the Live Activity even though the BG data is unchanged.
+        let colorsChanged = reason == Self.rangeModeChangedReason
+        guard !snapshotUnchanged || forceRefreshNeeded || colorsChanged else { return }
         guard ActivityAuthorizationInfo().areActivitiesEnabled else {
             LogManager.shared.log(category: .general, message: "[LA] refresh: LA update skipped — areActivitiesEnabled=false reason=\(reason)")
             return
@@ -1279,9 +1288,26 @@ final class LiveActivityManager {
     private func observePushToken(for activity: Activity<GlucoseLiveActivityAttributes>) {
         tokenObservationTask?.cancel()
         let activityID = activity.id
+        // An activity started through push-to-start may already hold its token, which
+        // pushTokenUpdates does not always deliver.
+        if let tokenData = activity.pushToken {
+            let token = tokenData.map { String(format: "%02x", $0) }.joined()
+            if token != pushToken {
+                let previousTail = pushToken.map { String($0.suffix(8)) } ?? "nil"
+                pushToken = token
+                LogManager.shared.log(
+                    category: .general,
+                    message: "[LA] push token read id=\(activityID) token=…\(token.suffix(8)) (prev=…\(previousTail))"
+                )
+                HubClient.shared.reportLiveActivitySoon()
+            }
+        } else {
+            LogManager.shared.log(category: .general, message: "[LA] no push token yet id=\(activityID)")
+        }
         tokenObservationTask = Task {
             for await tokenData in activity.pushTokenUpdates {
                 let token = tokenData.map { String(format: "%02x", $0) }.joined()
+                guard token != self.pushToken else { continue }
                 let previousTail = self.pushToken.map { String($0.suffix(8)) } ?? "nil"
                 let tail = String(token.suffix(8))
                 self.pushToken = token

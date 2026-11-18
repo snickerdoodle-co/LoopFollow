@@ -226,7 +226,12 @@ extension MainViewController {
                     continue
                 }
 
-                let reading = ShareGlucoseData(sgv: sgvValue, date: readingTimestamp, direction: data[data.count - 1 - i].direction)
+                let reading = ShareGlucoseData(
+                    sgv: sgvValue,
+                    date: readingTimestamp,
+                    direction: data[data.count - 1 - i].direction,
+                    isManual: data[data.count - 1 - i].isManual
+                )
                 bgData.append(reading)
             }
         }
@@ -317,8 +322,15 @@ extension MainViewController {
 
             // Live Activity storage
             Storage.shared.lastBgReadingTimeSeconds.value = lastBGTime
+            Storage.shared.lastBgMgdl.value = Double(latestBG)
             Storage.shared.lastDeltaMgdl.value = Double(deltaBG)
             Storage.shared.lastTrendCode.value = entries[latestEntryIndex].direction
+
+            // Live Activity Lock Screen mini graph: last 6 hours of readings.
+            let sixHoursAgo = lastBGTime - 6 * 3600
+            Storage.shared.lastBgHistory.value = entries
+                .filter { $0.date >= sixHoursAgo }
+                .map { LAHistoryPoint(d: $0.date, v: $0.sgv) }
 
             // Mark BG data as loaded for initial loading state
             self.markDataLoaded("bg")
@@ -327,6 +339,9 @@ extension MainViewController {
             #if !targetEnvironment(macCatalyst)
                 LiveActivityManager.shared.refreshFromCurrentState(reason: "bg")
             #endif
+
+            // Home screen widget
+            self.updateHomeScreenWidget(entries: entries, deltaBG: deltaBG)
 
             // Update contact
             if Storage.shared.contactEnabled.value, !HubClient.shared.isHubMode {

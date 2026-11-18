@@ -34,6 +34,8 @@ final class WatchSessionManager: NSObject {
 
     func activate() {
         guard let session else { return }
+        // Read on the main thread here, so building a state off it later finds the icon ready.
+        _ = AppIconManager.shared
         session.delegate = self
         session.activate()
         observeSettings()
@@ -52,6 +54,8 @@ final class WatchSessionManager: NSObject {
     private func observeSettings() {
         let triggers: [AnyPublisher<Void, Never>] = [
             Observable.shared.currentAlarm.$value.map { _ in () }.eraseToAnyPublisher(),
+            // "Snooze all" set or ended on the phone shows on the watch's snooze page at once.
+            Storage.shared.alarmConfiguration.$value.map { _ in () }.eraseToAnyPublisher(),
             Storage.shared.watchRemoteCommands.$value.map { _ in () }.eraseToAnyPublisher(),
             Storage.shared.remoteType.$value.map { _ in () }.eraseToAnyPublisher(),
             Storage.shared.colorBGText.$value.map { _ in () }.eraseToAnyPublisher(),

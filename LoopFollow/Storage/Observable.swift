@@ -17,12 +17,19 @@ class Observable {
 
     /// End of the active override as Unix epoch seconds; nil = no override or indefinite.
     var overrideEndAt = ObservableValue<TimeInterval?>(default: nil)
+    /// True while the currently active override entry was posted by Trio's Weekend Profile
+    /// feature (enteredBy == "Trio Weekend Profile") rather than a real Override.
+    var weekendProfileActive = ObservableValue<Bool>(default: false)
     /// End of the active temp target as Unix epoch seconds; nil = no active temp target.
     var tempTargetEndAt = ObservableValue<TimeInterval?>(default: nil)
 
     var minAgoText = ObservableValue<String>(default: "?? min ago")
     var bgText = ObservableValue<String>(default: "BG")
     var bg = ObservableValue<Int?>(default: nil)
+    /// The newest G7 reading the sensor marked unreliable, from Trio's "Unreliable Glucose" treatments (mg/dL and
+    /// epoch seconds): shown greyed with a warning, never alarmed on or counted.
+    var unreliableBG = ObservableValue<Int?>(default: nil)
+    var unreliableBGDate = ObservableValue<TimeInterval?>(default: nil)
     var bgStale = ObservableValue<Bool>(default: true)
     var bgTextColor = ObservableValue<Color>(default: .primary)
     var directionText = ObservableValue<String>(default: "-")
