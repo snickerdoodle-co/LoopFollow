@@ -2,6 +2,7 @@
 // LoopFollowLiveActivity.swift
 
 import ActivityKit
+import Charts
 import SwiftUI
 import WidgetKit
 
@@ -198,7 +199,7 @@ private struct LockScreenLiveActivityView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(alignment: .firstTextBaseline, spacing: 4) {
                         Text(LAFormat.glucose(s))
-                            .font(.system(size: 46, weight: .bold, design: .rounded))
+                            .font(.system(size: 36, weight: .bold, design: .rounded))
                             .monospacedDigit()
                             .foregroundStyle(.white)
                             .lineLimit(1)
@@ -207,24 +208,35 @@ private struct LockScreenLiveActivityView: View {
                             .layoutPriority(3)
 
                         Text(LAFormat.trendArrow(s))
-                            .font(.system(size: 32, weight: .bold, design: .rounded))
+                            .font(.system(size: 24, weight: .bold, design: .rounded))
                             .foregroundStyle(.white.opacity(0.95))
                             .lineLimit(1)
                             .fixedSize(horizontal: true, vertical: false)
                     }
 
                     Text("Delta: \(LAFormat.delta(s))")
-                        .font(.system(size: 15, weight: .semibold, design: .rounded))
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
                         .monospacedDigit()
                         .foregroundStyle(.white.opacity(0.80))
                         .lineLimit(1)
+
+                    // Trio's Apple Watch app has the pump: the same teal as the chart's watch mode band
+                    if s.watchModeSince != nil {
+                        Label("Watch mode", systemImage: "applewatch")
+                            .font(.system(size: 12, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Capsule().fill(Color.teal.opacity(0.9)))
+                    }
                 }
                 // as wide as the number needs: the graph takes the rest
                 .fixedSize(horizontal: true, vertical: false)
 
-                LAHistoryGraphView(history: s.history)
+                LAHistoryGraphView(history: LAGraphHistory.points(for: s))
                     .frame(maxWidth: .infinity)
-                    .frame(height: 72)
+                    .frame(height: 80)
             }
 
             ActiveAdjustmentsView(snapshot: s)
@@ -815,9 +827,29 @@ private enum LAFormat {
 
 // MARK: - Lock screen history graph
 
-/// Mini version of the main screen's BG graph for the Lock Screen widget.
-/// Colors each short line segment with the same dynamic gradient as the main
-/// chart and the glucose number, using each segment's midpoint value.
+/// The graph's readings. An update can arrive without them: from LF Hub, which builds its own updates, or as a push
+/// too large to carry them. The card then drew its graph from the app's update for a moment, and the next update
+/// took it away. Such an update now takes the readings the app keeps for the home screen widget in the App Group,
+/// up to this update's reading, which it adds when the stored ones end earlier.
+enum LAGraphHistory {
+    static func points(for snapshot: GlucoseSnapshot) -> [LAHistoryPoint] {
+        if snapshot.history.count >= 2 { return snapshot.history }
+        guard let stored = WidgetBGStore.load() else { return snapshot.history }
+        let end = snapshot.updatedAt.timeIntervalSince1970
+        let start = end - WidgetBGStore.historySeconds
+        var points = stored.points
+            .filter { $0.date >= start && $0.date <= end + 60 }
+            .map { LAHistoryPoint(d: $0.date, v: Int($0.mgdl.rounded())) }
+        if snapshot.glucose > 0, (points.last?.d ?? 0) < end - 60 {
+            points.append(LAHistoryPoint(d: end, v: Int(snapshot.glucose.rounded())))
+        }
+        return points
+    }
+}
+
+/// The Lock Screen graph, drawn as Trio's Live Activity draws its own (LiveActivityChartView): the readings as dots in
+/// the dynamic glucose colors, dashed high and low lines, a solid target line and dashed hour lines, over 6 hours up to
+/// now, with the scale reaching from at most 39 to at least 300 mg/dL as in Trio.
 private struct LAHistoryGraphView: View {
     let history: [LAHistoryPoint]
 
@@ -826,31 +858,49 @@ private struct LAHistoryGraphView: View {
             Color.clear
         } else {
             let t = LAAppGroupSettings.thresholdsMgdl()
-            let minDate = history.first!.d
-            let maxDate = history.last!.d
-            let dateRange = max(maxDate - minDate, 1)
-            let minValue = Double(history.map(\.v).min() ?? 0)
-            let maxValue = Double(history.map(\.v).max() ?? 1)
-            let valueRange = max(maxValue - minValue, 1)
+            let values = history.map { Double($0.v) }
+            let yMin = min(values.min() ?? 39, 39)
+            let yMax = max(values.max() ?? 300, 300)
+            let newest = Date(timeIntervalSince1970: history.last?.d ?? Date().timeIntervalSince1970)
+            let xEnd = max(Date(), newest)
+            let xStart = xEnd.addingTimeInterval(-6 * 3600)
 
-            Canvas { context, size in
-                for (a, b) in zip(history, history.dropFirst()) {
-                    let midValue = (Double(a.v) + Double(b.v)) / 2
-                    let x1 = size.width * CGFloat((a.d - minDate) / dateRange)
-                    let y1 = size.height * (1 - CGFloat((Double(a.v) - minValue) / valueRange))
-                    let x2 = size.width * CGFloat((b.d - minDate) / dateRange)
-                    let y2 = size.height * (1 - CGFloat((Double(b.v) - minValue) / valueRange))
+            Chart {
+                RuleMark(y: .value("High", t.high))
+                    .foregroundStyle(dynamicGlucoseColor(glucoseValue: t.high, low: t.low, target: t.target, high: t.high))
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [5]))
 
-                    var segment = Path()
-                    segment.move(to: CGPoint(x: x1, y: y1))
-                    segment.addLine(to: CGPoint(x: x2, y: y2))
+                RuleMark(y: .value("Low", t.low))
+                    .foregroundStyle(dynamicGlucoseColor(glucoseValue: t.low, low: t.low, target: t.target, high: t.high))
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [5]))
 
-                    context.stroke(
-                        segment,
-                        with: .color(dynamicGlucoseColor(glucoseValue: midValue, low: t.low, target: t.target, high: t.high)),
-                        style: StrokeStyle(lineWidth: 5, lineCap: .round, lineJoin: .round)
+                RuleMark(y: .value("Target", t.target))
+                    .foregroundStyle(.green.gradient)
+                    .lineStyle(StrokeStyle(lineWidth: 1.5))
+
+                ForEach(history.filter { $0.d >= xStart.timeIntervalSince1970 }, id: \.self) { point in
+                    PointMark(
+                        x: .value("Time", Date(timeIntervalSince1970: point.d)),
+                        y: .value("Glucose", Double(point.v))
                     )
+                    .symbolSize(16)
+                    .foregroundStyle(
+                        dynamicGlucoseColor(glucoseValue: Double(point.v), low: t.low, target: t.target, high: t.high)
+                    )
+                    .shadow(color: Color.black.opacity(0.25), radius: 2, x: 0, y: 0)
                 }
+            }
+            .chartYScale(domain: yMin ... yMax)
+            .chartYAxis(.hidden)
+            .chartXScale(domain: xStart ... xEnd)
+            .chartXAxis {
+                AxisMarks(values: .stride(by: .hour)) { _ in
+                    AxisGridLine(stroke: StrokeStyle(lineWidth: 0.65, dash: [2, 3]))
+                        .foregroundStyle(Color.white.opacity(0.5))
+                }
+            }
+            .chartPlotStyle { plotContent in
+                plotContent.clipShape(RoundedRectangle(cornerRadius: 12))
             }
         }
     }

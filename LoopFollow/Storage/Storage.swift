@@ -168,6 +168,8 @@ class Storage {
     var highLine = StorageValue<Double>(key: "highLine", defaultValue: 180.0)
     var targetLine = StorageValue<Double>(key: "targetLine", defaultValue: 100.0)
     var lastBgHistory = StorageValue<[LAHistoryPoint]>(key: "lastBgHistory", defaultValue: [])
+    /// Since when Trio's watch mode runs (its running "Untethered Watch" treatment), Unix seconds; 0 when it doesn't.
+    var watchModeSince = StorageValue<TimeInterval>(key: "watchModeSince", defaultValue: 0)
     var downloadDays = StorageValue<Int>(key: "downloadDays", defaultValue: 1)
     var graphTimeZoneEnabled = StorageValue<Bool>(key: "graphTimeZoneEnabled", defaultValue: false)
     var graphTimeZoneIdentifier = StorageValue<String>(key: "graphTimeZoneIdentifier", defaultValue: TimeZone.current.identifier)
@@ -253,7 +255,7 @@ class Storage {
     // When adding a new migration step in `runMigrationsIfNeeded()`, bump this default
     // to the new latest step number so fresh installs skip all migrations. Other defaults
     // in this file must reflect the post-migration final state for a fresh install.
-    var migrationStep = StorageValue<Int>(key: "migrationStep", defaultValue: 10)
+    var migrationStep = StorageValue<Int>(key: "migrationStep", defaultValue: 11)
 
     var persistentNotification = StorageValue<Bool>(key: "persistentNotification", defaultValue: false)
     var persistentNotificationLastBGTime = StorageValue<Date>(key: "persistentNotificationLastBGTime", defaultValue: .distantPast)

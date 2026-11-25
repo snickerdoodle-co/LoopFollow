@@ -244,7 +244,13 @@ class APNSClient {
             guard let object = build(stride),
                   let data = try? JSONSerialization.data(withJSONObject: object)
             else { return nil }
-            if data.count <= Self.maxPayloadBytes { return data }
+            if data.count <= Self.maxPayloadBytes {
+                // only when the graph had to be thinned, so the log shows how close the payload runs to the limit
+                if stride > 1 {
+                    LogManager.shared.log(category: .apns, message: "APNs payload \(data.count) bytes with every \(stride)th graph reading")
+                }
+                return data
+            }
         }
         LogManager.shared.log(category: .apns, message: "APNs payload too large even with thinned history — sending without graph")
         guard let object = build(0) else { return nil }
@@ -301,6 +307,7 @@ class APNSClient {
         if snapshot.iageInsertTime > 0 { snapshotDict["iageInsertTime"] = snapshot.iageInsertTime }
         if let minBgMgdl = snapshot.minBgMgdl { snapshotDict["minBgMgdl"] = minBgMgdl }
         if let maxBgMgdl = snapshot.maxBgMgdl { snapshotDict["maxBgMgdl"] = maxBgMgdl }
+        if let watchModeSince = snapshot.watchModeSince { snapshotDict["watchModeSince"] = watchModeSince }
 
         // Lock Screen mini graph. Without this every pushed update (all
         // background updates) arrives with an empty history and the graph

@@ -3,7 +3,7 @@
 
 import Foundation
 
-/// Trio's untethered watch mode: while its Apple Watch app has the pump, Trio uploads an "Untethered Watch" treatment
+/// Trio's watch mode (called untethered mode in its code and in the Nightscout event type): while its Apple Watch app has the pump, Trio uploads an "Untethered Watch" treatment
 /// at the start, without a duration, and the same one with its duration at the end (Nightscout keeps one treatment
 /// per time and type, so the end replaces the start). Shown as a band in the chart and as a row in the info table.
 extension MainViewController {
@@ -31,6 +31,7 @@ extension MainViewController {
         }
         untetheredGraphData = spans
 
+        noteWatchModeForLiveActivity(since: spans.last.flatMap { $0.ongoing ? $0.date : nil })
         if let running = spans.last, running.ongoing {
             let formatter = DateFormatter()
             formatter.timeStyle = .short
@@ -43,7 +44,18 @@ extension MainViewController {
         }
     }
 
+    /// The Live Activity shows a watch mode badge while a session runs: updated as soon as one starts or ends.
+    private func noteWatchModeForLiveActivity(since: TimeInterval?) {
+        let value = since ?? 0
+        guard Storage.shared.watchModeSince.value != value else { return }
+        Storage.shared.watchModeSince.value = value
+        #if !targetEnvironment(macCatalyst)
+            LiveActivityManager.shared.refreshFromCurrentState(reason: "watchMode")
+        #endif
+    }
+
     func clearOldUntethered() {
+        noteWatchModeForLiveActivity(since: nil)
         untetheredGraphData.removeAll()
         infoManager.clearInfoData(type: .untethered)
         updateUntetheredGraph()
